@@ -73,6 +73,6 @@ Run commands from the repository root unless noted otherwise.
 
 This repository is currently not licensed for public reuse. Unless a separate license is added, all rights are reserved for the project-specific code in this repository.
 
-This work was developed in connection with the NIST SURF project “Development of visualization frontends for cellular 5G-NR measurements.” Reuse, redistribution, or derivative work should be approved by the repository maintainer AND the appropriate NIST project mentors (Dr. Aric Sander & Dr. Dan Kuester) before use outside the intended NIST research context.
+This work was developed in connection with the NIST SURF project “Development of visualization frontends for cellular 5G-NR measurements.” Reuse, redistribution, or derivative work should be approved by the appropriate NIST project mentors (Dr. Aric Sanders & Dr. Dan Kuester) and the repository maintainer before use outside the intended NIST research context.
 
 The `striqt/` library included in this repository was developed separately and is not authored by Mustafa Omran. It is included here as a supporting RF/IQ acquisition and analysis library for the live visualization workflow. Its own README, notices, and license terms should be preserved and followed.
