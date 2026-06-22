@@ -69,8 +69,10 @@ Run commands from the repository root unless noted otherwise.
 - `striqt_frontend_TCP.py` defaults to `192.168.50.1:5005`; pass a host or `--port` when
   using a different network setup.
 
-## License
+## License and Attribution
 
-This software was developed by employees of the National Institute of Standards and Technology (NIST), an agency of the U.S. Federal Government. Pursuant to title 17 United States Code Section 105, works of NIST employees are not subject to copyright protection in the United States and are considered to be in the public domain.
+This repository is currently not licensed for public reuse. Unless a separate license is added, all rights are reserved for the project-specific code in this repository.
 
-This software is provided "AS IS." NIST makes no warranty of any kind.
+This work was developed in connection with the NIST SURF project “Development of visualization frontends for cellular 5G-NR measurements.” Reuse, redistribution, or derivative work should be approved by the repository maintainer AND the appropriate NIST project mentors (Dr. Aric Sander & Dr. Dan Kuester) before use outside the intended NIST research context.
+
+The `striqt/` library included in this repository was developed separately and is not authored by Mustafa Omran. It is included here as a supporting RF/IQ acquisition and analysis library for the live visualization workflow. Its own README, notices, and license terms should be preserved and followed.
