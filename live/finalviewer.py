@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """
-Live two-port spectrogram + PSD viewer (runs on the Mac) -- full featured.
+Live two-port spectrogram + PSD viewer (runs on the mac/windows/whatever device your using)
 
-Two display modes, chosen from the "Mode" menu:
-  * Boring Mode 🥱  -- the image is one contiguous capture and refreshes wholesale
-                every update (capture length == the time-scale you pick). This
-                is the main view; its time axis is exact.
-  * Cool Mode 😎 -- the older scrolling view. The time-scale menu sets how far
-                back the pane "remembers".
-
-The "Window (ms)" menu sets the time scale for whichever mode is active, and
-the spectrogram y-axis is calibrated to it: 0 ms (now) at the top, the window
-length at the bottom, newest at the top.
-
-Pairs with airt_live_server_full.py. numpy + pyqtgraph + PyQt6 + stdlib.
+Pairs with airt_live_server_full.py to visualize incoming data.
 Start the server first, then run this:  python3 live_viewer_full.py <ip> [--port N]
 """
 
