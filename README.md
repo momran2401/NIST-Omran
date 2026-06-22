@@ -68,3 +68,9 @@ Run commands from the repository root unless noted otherwise.
   `striqt` imports are available on the machine running acquisition.
 - `striqt_frontend_TCP.py` defaults to `192.168.50.1:5005`; pass a host or `--port` when
   using a different network setup.
+
+## License
+
+This software was developed by employees of the National Institute of Standards and Technology (NIST), an agency of the U.S. Federal Government. Pursuant to title 17 United States Code Section 105, works of NIST employees are not subject to copyright protection in the United States and are considered to be in the public domain.
+
+This software is provided "AS IS." NIST makes no warranty of any kind.
