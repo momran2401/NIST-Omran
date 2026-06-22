@@ -1,0 +1,351 @@
+"""data structures that specify waveform characteristics"""
+
+from __future__ import annotations as __
+
+import fractions
+from math import inf
+import typing
+from typing import Union
+
+import msgspec
+from typing_extensions import Self
+
+from . import helpers, types
+import striqt.waveform as sw
+
+
+_T = typing.TypeVar('_T')
+_TS = typing.TypeVar('_TS', bound='SpecBase')
+
+
+class SpecBase(
+    msgspec.Struct,
+    kw_only=True,
+    frozen=True,
+    forbid_unknown_fields=True,
+    cache_hash=True,
+):
+    """Base type for structures that support validated
+    (de)serialization.
+
+    It is a `msgspec.Struct` class with some often-used utility
+    methods that fix encoding and decoding hooks for extra types.
+    """
+
+    def replace(self, **attrs) -> Self:
+        """returns a copy of self with changed attributes.
+
+        See also:
+            Python standard library `copy.replace`
+        """
+        if len(attrs) == 0:
+            return self
+        return msgspec.structs.replace(self, **attrs).validate()
+
+    def to_dict(self, unfreeze: bool = False, allow_tuple_keys: bool = True) -> dict:
+        """return a dictinary representation of `self`"""
+        if allow_tuple_keys:
+            enc_hook = helpers._enc_hook
+        else:
+            enc_hook = helpers._enc_hook_no_tuple_keys
+
+        map = msgspec.to_builtins(self, enc_hook=enc_hook)
+
+        if unfreeze:
+            depths = helpers.inspect_freeze_depths(type(self))
+            for name, depth in depths.items():
+                map[name] = helpers.unfreeze(map[name], depth)
+
+        return map
+
+    @classmethod
+    def from_dict(cls: type[_T], d: dict) -> _T:
+        return helpers.convert_dict(d, type=cls)
+
+    @classmethod
+    def from_spec(cls: type[_T], other: SpecBase) -> _T:
+        return helpers.convert_spec(other, type=cls)
+
+    def validate(self) -> Self:
+        return _validate(self)
+
+    def __post_init__(self):
+        for name, depth in helpers.inspect_freeze_depths(type(self)).items():
+            v = getattr(self, name)
+            if isinstance(v, (tuple, dict, list)):
+                frozen = helpers.freeze(v, depth + 1)
+                msgspec.structs.force_setattr(self, name, frozen)
+
+
+@sw.util.lru_cache(1024)
+def _validate(spec: _TS) -> _TS:
+    return spec.from_dict(spec.to_dict())
+
+
+class Capture(SpecBase, kw_only=True, frozen=True):
+    """bare minimum information about an IQ acquisition"""
+
+    # acquisition
+    duration: types.Duration = 0.1
+    sample_rate: types.SampleRate = 15.36e6
+    analysis_bandwidth: types.AnalysisBandwidth = inf
+
+    def __post_init__(self):
+        from ..lib import util
+
+        super().__post_init__()
+
+        if not util.isroundmod(self.duration * self.sample_rate, 1):
+            raise ValueError(
+                f'duration {self.duration!r} is not an integer multiple of sample period'
+            )
+
+
+class AnalysisFilter(SpecBase, kw_only=True, frozen=True):
+    nfft: int = 8192
+    window: types.WindowType = 'hamming'
+    nfft_out: int | None = None
+
+
+class FilteredCapture(Capture, kw_only=True, frozen=True):
+    # filtering and resampling
+    analysis_filter: AnalysisFilter = msgspec.field(default_factory=AnalysisFilter)
+    # analysis_filter: dict = msgspec.field(
+    #     default_factory=lambda: {'nfft': 8192, 'window': 'hamming'}
+    # )
+
+
+class AnalysisKeywords(typing.TypedDict, total=False):
+    as_xarray: Union[bool, typing.Literal['delayed']]
+
+
+class Analysis(SpecBase, kw_only=True, frozen=True):
+    """
+    Returns:
+        Analysis result of type `(xarray.DataArray if as_xarray else type(iq))`
+
+    Args:
+        iq (numpy.ndarray or cupy.ndarray): the M-channel input waveform of shape (M,N)
+        capture:
+        as_xarray (bool): True to return xarray.DataArray or False to match type(iq)
+    """
+
+
+class AnalysisGroup(SpecBase, kw_only=True, frozen=True):
+    """base class for a defining set of Analysis specs"""
+
+    pass
+
+
+# %% Spectral analysis
+class FrequencyAnalysisSpecBase(
+    Analysis,
+    kw_only=True,
+    frozen=True,
+    dict=True,
+):
+    """
+    window (specs.types.WindowType): a window specification, following `scipy.signal.get_window`
+    frequency_resolution (float): the STFT resolution (in Hz)
+    fractional_overlap (float):
+        fraction of each FFT window that overlaps with its neighbor
+    window_fill (float):
+        fraction of each FFT window that is filled with the window function
+        (leaving the rest zeroed)
+    integration_bandwidth (float): bin bandwidth for RMS averaging in the frequency domain
+    trim_stopband (bool):
+        whether to trim the frequency axis to capture.analysis_bandwidth
+    """
+
+    window: types.WindowType
+    frequency_resolution: float
+    fractional_overlap: fractions.Fraction = 0  # type: ignore
+    window_fill: fractions.Fraction = 1  # type: ignore
+    integration_bandwidth: typing.Optional[float] = None
+    trim_stopband: bool = True
+    lo_bandstop: Union[types.LOBandstop, None] = None
+
+
+class Cellular5GNRSSBSpectrogram(Analysis, kw_only=True, frozen=True):
+    """
+    sample_rate (float): output sample rate for the resampled synchronization waveform (samples/s)
+    discovery_periodicity (float): time period between synchronization blocks (s)
+    frequency_offset (float or dict[float, float]):
+        center frequency offset (see notes)
+    shared_spectrum:
+        whether to follow the 3GPP "shared spectrum" synchronizatio block layout
+    max_block_count: number of synchronization blocks to evaluate
+    """
+
+    subcarrier_spacing: types.CellularSubcarrierSpacing
+
+    # ssb parameters
+    sample_rate: float = 15.36e6 / 2
+    discovery_periodicity: float = 20e-3
+    frequency_offset: float = 0
+    max_block_count: typing.Optional[int] = None
+
+    # spectrogram info
+    window: types.WindowType = ('kaiser_by_enbw', 2)
+    lo_bandstop: typing.Optional[float] = None
+
+    # hard-coded for re-use by PSS/SSS functions
+    shared_spectrum = False
+
+
+# %% Cellular 5G NR synchronizatino
+class _Cellular5GNRSSBCorrelator(Analysis, kw_only=True, frozen=True):
+    """
+    sample_rate (float): output sample rate for the resampled synchronization waveform (samples/s)
+    discovery_periodicity (float): time period between synchronization blocks (s)
+    frequency_offset (float or dict[float, float]):
+        center frequency offset (see notes)
+    shared_spectrum:
+        whether to follow the 3GPP "shared spectrum" synchronizatio block layout
+    delay: minimum time delay (in s) to start of SSB set
+    """
+
+    subcarrier_spacing: types.CellularSubcarrierSpacing
+    sample_rate: float = 15.36e6 / 2
+    discovery_periodicity: float = 20e-3
+    frequency_offset: float = 0
+    shared_spectrum: bool = False
+    delay: float = 0
+    symbol_indexes: types.CellSSBSymbolIndexes = 'auto'
+    max_lag_symbols: Union[types.MaxLagSymbols, None] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not sw.arrays.isroundmod(self.delay * self.sample_rate, 1):
+            raise msgspec.ValidationError('delay * sample_rate must be an integer')
+
+
+class Cellular5GNRPSSCorrelator(_Cellular5GNRSSBCorrelator, kw_only=True, frozen=True):
+    # same as SSS, but the registry requires unique spec types
+    max_block_count: typing.Optional[int] = 1
+
+
+class Cellular5GNRSSSCorrelator(_Cellular5GNRSSBCorrelator, kw_only=True, frozen=True):
+    max_block_count: typing.Optional[int] = 1
+
+
+class _Cellular5GNRSSBSync(_Cellular5GNRSSBCorrelator, frozen=True, kw_only=True):
+    window_fill: types.WindowFill = 1
+    per_port: types.PerPort = False
+    max_beams: Union[types.MaxBeams, None] = None
+
+
+class Cellular5GNPSSSync(_Cellular5GNRSSBSync, kw_only=True, frozen=True):
+    # same as SSS, but the registry requires unique spec types
+    pass
+
+
+class Cellular5GNSSSSync(_Cellular5GNRSSBSync, kw_only=True, frozen=True):
+    pass
+
+
+class Spectrogram(FrequencyAnalysisSpecBase, kw_only=True, frozen=True):
+    """
+    time_aperture (float):
+        if specified, binned RMS averaging is applied along time axis in the
+        spectrogram to yield this coarser resolution (s)
+    dB (bool): if True, returned power is transformed into dB units
+    """
+
+    time_aperture: typing.Optional[float] = None
+    dB = True
+
+
+class CellularCyclicAutocorrelator(Analysis, kw_only=True, frozen=True):
+    subcarrier_spacings: types.CellularSubcarrierSpacingTuple = (15e3, 30e3, 60e3)
+    frame_range: Union[int, tuple[int, int]] = (0, 1)
+    frame_slots: types.CellularFrame = None
+    symbol_range: Union[int, tuple[int, Union[int, None]]] = (0, None)
+    generation: typing.Literal['4G', '5G'] = '5G'
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if isinstance(self.frame_range, tuple) and self.frame_range[0] > 0:
+            assert self.frame_range[1] is not None
+            assert self.frame_range[1] >= self.frame_range[0]
+        if isinstance(self.symbol_range, tuple) and self.symbol_range[0] > 0:
+            assert self.symbol_range[1] is not None
+            assert self.symbol_range[1] >= self.symbol_range[0]
+
+
+class CellularResourcePowerHistogram(
+    Analysis,
+    kw_only=True,
+    frozen=True,
+    dict=True,
+):
+    window: types.WindowType
+    subcarrier_spacing: types.CellularSubcarrierSpacing
+    power_low: types.PowerBinMin
+    power_high: types.PowerBinMax
+    power_resolution: types.PowerBinStep
+    average_rbs: types.CellularAverageRBs = False
+    average_slots: types.CellularAverageSlots = False
+    guard_bandwidths: types.GuardBandwidths = (0, 0)
+    frame_slots: types.CellularFrame = None
+    special_symbols: types.CellularSpecialSymbols = None
+    cyclic_prefix: types.CellularCyclicPrefix = 'normal'
+    lo_bandstop: Union[types.LOBandstop, None] = None
+
+
+class ChannelPowerTimeSeries(
+    Analysis,
+    kw_only=True,
+    frozen=True,
+):
+    detector_period: fractions.Fraction
+    power_detectors: tuple[str, ...] = ('rms', 'peak')
+
+
+class ChannelPowerHistogram(
+    ChannelPowerTimeSeries,
+    kw_only=True,
+    frozen=True,
+):
+    power_low: types.PowerBinMin
+    power_high: types.PowerBinMax
+    power_resolution: types.PowerBinStep
+
+
+class CyclicChannelPower(Analysis, kw_only=True, frozen=True):
+    cyclic_period: float
+    detector_period: fractions.Fraction
+    power_detectors: tuple[str, ...] = ('rms', 'peak')
+    cyclic_statistics: tuple[Union[str, float], ...] = ('min', 'mean', 'max')
+
+
+class IQWaveform(
+    Analysis,
+    kw_only=True,
+    frozen=True,
+):
+    start_time_sec: typing.Optional[float] = None
+    stop_time_sec: typing.Optional[float] = None
+
+
+class PowerSpectralDensity(FrequencyAnalysisSpecBase, kw_only=True, frozen=True):
+    time_statistic: tuple[Union[str, float], ...] = ('mean',)
+
+
+class SpectrogramHistogram(
+    Spectrogram,
+    kw_only=True,
+    frozen=True,
+):
+    power_low: types.PowerBinMin
+    power_high: types.PowerBinMax
+    power_resolution: types.PowerBinStep
+
+
+class SpectrogramHistogramRatio(
+    SpectrogramHistogram,
+    kw_only=True,
+    frozen=True,
+):
+    pass

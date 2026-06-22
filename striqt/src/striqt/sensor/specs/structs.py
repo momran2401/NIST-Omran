@@ -1,0 +1,537 @@
+"""schema for the specification of calibration and sweeps"""
+
+from __future__ import annotations as __
+
+import dataclasses
+from typing import Any, cast, ClassVar, Generic, Literal, Optional, TYPE_CHECKING, Union
+
+import msgspec
+
+import striqt.analysis as sa
+from striqt.analysis.specs import AnalysisGroup, SpecBase, Capture, frozendict
+
+from ..lib import util
+from ..lib.typing import TypeVar, SS, SP, SC, SPC
+from . import types
+
+
+if TYPE_CHECKING:
+    _T = TypeVar('_T')
+    from typing_extensions import Self as _Self
+
+    # pd imports need to be here for msgspec to resolve timestamp types
+    import pandas as pd
+    import SoapySDR  # type: ignore
+else:
+    pd = util.lazy_import('pandas')
+
+
+@sa.util.lru_cache()
+def _validate_multichannel(port, gain):
+    """ensure self.gain is a number or matches len(self.port)"""
+    if not isinstance(port, tuple):
+        if isinstance(gain, tuple):
+            raise ValueError(
+                'gain must be a single number unless multiple ports are specified'
+            )
+    else:
+        if isinstance(gain, tuple) and len(gain) != len(port):
+            raise ValueError('gain, when specified as a tuple, must match port count')
+
+
+# %% Capture specs
+
+
+class SensorCapture(Capture, frozen=True, kw_only=True):
+    """Capture specification for a generic waveform with resampling support"""
+
+    # acquisition
+    port: types.Port
+    lo_shift: types.LOShift = 'none'
+    host_resample: bool = True
+    backend_sample_rate: Optional[types.BackendSampleRate] = None
+    adjust_analysis: types.AnalysisAdjustments = msgspec.field(default_factory=dict)
+
+
+class SoapyCapture(SensorCapture, frozen=True, kw_only=True):
+    center_frequency: types.CenterFrequency
+    gain: types.Gain
+
+    def __post_init__(self):
+        super().__post_init__()
+        _validate_multichannel(self.port, self.gain)
+
+
+class SingleToneCapture(SensorCapture, frozen=True, kw_only=True):
+    frequency_offset: types.FrequencyOffset = 0
+    snr: Optional[types.SNR] = None
+
+
+class DiracDeltaCapture(SensorCapture, frozen=True, kw_only=True):
+    time: types.TimeOffset = 0
+    power: types.Power = 0
+
+
+class SawtoothCapture(SensorCapture, kw_only=True, frozen=True, dict=True):
+    period: types.Period = 0.01
+    power: types.Power = 0
+
+
+class NoiseCapture(SensorCapture, kw_only=True, frozen=True, dict=True):
+    noise_psd: types.PSD = 1e-17
+
+
+class FileCapture(SensorCapture, frozen=True, kw_only=True):
+    """Capture specification read from a file, with support for None sentinels"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.backend_sample_rate is not None:
+            raise TypeError('backend_sample_rate is fixed by the file source')
+
+
+# %% Source specs
+
+
+class Source(SpecBase, frozen=True, kw_only=True):
+    """run-time characteristics of the radio that are left invariant during a sweep"""
+
+    # acquisition
+    master_clock_rate: types.MasterClockRate
+
+    # synchronization and triggering
+    trigger_strobe: Union[float, None] = None
+    signal_trigger: Union[str, AnalysisGroup, None] = None
+
+    # in the future, these should probably move to an analysis config
+    array_backend: types.ArrayBackend = 'numpy'
+
+    # no hint yet. source implementation expects these to exist, but
+    # this leaves room for subclasses to add schema fields
+    gapless = False
+    calibration = None
+
+    # validation data
+    transient_holdoff_time: ClassVar[float] = 0
+    stream_all_rx_ports: ClassVar[Union[bool, None]] = False
+    transport_dtype: ClassVar[types.TransportDType] = 'float32'
+
+
+class SoapySource(Source, frozen=True, kw_only=True):
+    calibration: Optional[str] = None
+    time_source: types.TimeSource = 'host'
+    time_sync_at: types.TimeSyncOn = 'acquire'
+    clock_source: types.ClockSource = 'internal'
+    receive_retries: types.ReceiveRetries = 0
+    adc_overload_limit: types.ADCOverloadLimit = -1
+    if_overload_limit: types.IFOverloadLimit = None
+
+    # set this True if the same clock drives acquisition on all RX ports
+    shared_rx_sample_clock = True
+    rx_enable_delay = 0.0
+    gapless: types.GaplessRepeat = False
+
+    def __post_init__(self):
+        from striqt.analysis import registry
+
+        super().__post_init__()
+
+        if not self.gapless:
+            pass
+        elif self.time_sync_at == 'acquire':
+            raise ValueError('time_sync_at must be "open" when gapless')
+        elif self.receive_retries > 0:
+            raise ValueError('receive_retries must be 0 when gapless is enabled')
+        if self.signal_trigger is None:
+            pass
+        elif self.signal_trigger not in registry.signal_trigger:
+            registered = set(registry.signal_trigger)
+            raise ValueError(
+                f'signal_trigger "{self.signal_trigger!r}" is not one of the registered functions {registered!r}'
+            )
+
+
+class FunctionSource(Source, kw_only=True, frozen=True):
+    # make these configurable, to support matching hardware for warmup sweeps
+    num_rx_ports: int
+    stream_all_rx_ports: ClassVar[bool] = False
+    transport_dtype: ClassVar[types.TransportDType] = 'complex64'
+
+
+class NoSource(Source, frozen=True, kw_only=True):
+    # make these configurable, to support matching hardware for warmup sweeps
+    num_rx_ports: int
+    stream_all_rx_ports: ClassVar[bool] = False
+
+
+class MATSource(Source, kw_only=True, frozen=True):
+    path: types.WaveformInputPath
+    file_format: types.Format = 'auto'
+    file_metadata: Union[types.FileMetadata, None] = None
+    loop: types.FileLoop = False
+    transport_dtype: ClassVar[types.TransportDType] = 'complex64'
+
+
+class TDMSSource(Source, frozen=True, kw_only=True):
+    path: types.WaveformInputPath
+
+
+class ZarrIQSource(Source, frozen=True, kw_only=True):
+    path: types.WaveformInputPath
+    center_frequency: types.CenterFrequency
+    select: types.ZarrSelect = dict()
+    transport_dtype: ClassVar[types.TransportDType] = 'complex64'
+
+
+# %% Sweep metadata - not used in sweep control flow
+
+
+class Description(SpecBase, frozen=True, kw_only=True):
+    summary: Optional[str] = None
+    version: str = 'unversioned'
+
+
+class SharedPlotOptions(
+    SpecBase, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    # further validation in striqt.figures.specs subclass
+    style: str | None = None
+    col: str | None = 'port'
+    row: str | None = None
+    col_label_format: str = 'Port {port}'
+    row_label_format: str | None = None
+    col_wrap: int | None = None
+    suptitle_fmt: str = '{start_time}'
+    filename_fmt: str = '{name} {start_time}.svg'
+
+
+class DataOptions(SpecBase, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    # further validation in striqt.figures.specs subclass
+    groupby_dims: tuple[str, ...] = ()
+    sweep_index: int
+    query: str | None = None
+    select: dict[str, Any] = msgspec.field(default_factory=dict)
+
+
+class PlotOptions(SpecBase, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    # further validation in striqt.figures.specs subclass
+    data: DataOptions
+    plotter: SharedPlotOptions
+    variables: dict[str, dict[str, Any]] = msgspec.field(default_factory=dict)
+
+
+# %% Sequencing specs
+
+
+class LoopBase(SpecBase, tag=str.lower, tag_field='kind', frozen=True, kw_only=True):
+    field: Union[str, None]
+    isin: types.IsIn = 'capture'
+
+    def get_points(self) -> list:
+        raise NotImplementedError
+
+
+class Range(LoopBase, frozen=True, kw_only=True):
+    field: str
+    start: float
+    stop: float
+    step: float
+
+    def get_points(self) -> list:
+        import numpy as np
+
+        if self.start == self.stop:
+            return [self.start]
+
+        a = np.arange(self.start, self.stop + self.step / 2, self.step)
+        return a.tolist()
+
+
+class Repeat(LoopBase, frozen=True, kw_only=True):
+    field: None = None
+    count: int = 1
+
+    def get_points(self) -> list[int]:
+        return list(range(self.count))
+
+
+class List(LoopBase, frozen=True, kw_only=True):
+    field: str
+    values: tuple[Union[AdjustCapturesType, str, float, int, bool, None], ...]
+
+    def get_points(self) -> list:
+        return list(self.values)
+
+
+class FrequencyBinRange(LoopBase, frozen=True, kw_only=True):
+    field: str
+    start: float
+    stop: float
+    step: float
+
+    def get_points(self) -> list[float]:
+        from math import ceil
+        import numpy as np
+
+        span = self.stop - self.start
+        count = ceil(span / self.step)
+        expanded_span = count * self.step
+        points = np.linspace(-expanded_span / 2, expanded_span / 2, count + 1)
+        if points[0] < self.start:
+            points = points[1:]
+        if points[-1] > self.stop:
+            points = points[:-1]
+        return points.tolist()
+
+
+LoopSpec = Union[Repeat, List, Range, FrequencyBinRange]
+
+
+# %% Peripheral specs
+class Peripherals(SpecBase, frozen=True, kw_only=True):
+    pass
+
+
+class NoPeripherals(Peripherals, frozen=True, kw_only=True):
+    pass
+
+
+class ManualYFactorPeripheral(Peripherals, frozen=True, kw_only=True):
+    enr: types.ENR
+    ambient_temperature: types.AmbientTemperature
+
+
+# %% Top-level Sweep specifications
+BundledAnalysis = sa.registry.tospec()
+BundledTriggers = sa.registry.signal_trigger.to_spec()
+
+
+class Sink(SpecBase, frozen=True, kw_only=True):
+    path: str = '{yaml_name}-{start_time}'
+    log_path: Optional[str] = None
+    log_level: str = 'info'
+    store: types.StoreFormat = 'directory'
+
+    # zarr store tuning parameters
+    max_threads: Optional[int] = None
+    batched_write_count: int = 1
+    max_chunk_bytes: int = 50000000
+
+
+class Extension(SpecBase, frozen=True, kw_only=True):
+    sink: Union[types.SinkClass, None] = None
+    import_path: Optional[types.ExtensionPath] = None
+    import_name: types.ModuleName = None
+
+
+class SweepOptions(SpecBase, frozen=True, kw_only=True):
+    reuse_iq: bool = False
+    loop_only_nyquist: bool = False
+    skip_warmup: types.SkipWarmup = True
+
+
+SWEEP_TAG_FIELD = 'sensor_binding'
+
+
+class CaptureRemap(SpecBase, frozen=True, kw_only=True):
+    key: Union[str, tuple[str, ...]]
+    lookup: dict[Union[tuple[Any, ...], Any], Any]
+    required: bool = True
+    default: Any = msgspec.UNSET
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.key, tuple) or len(self.key) == 1:
+            super().__post_init__()
+            return
+
+        # convert any stringified json array keys into tuples
+        lookup = dict(self.lookup)
+        for k in self.lookup.keys():
+            if not isinstance(k, tuple):
+                new_key = msgspec.json.decode(k, type=tuple)
+                lookup[new_key] = lookup.pop(k)
+        lookup = sa.specs.helpers.freeze(lookup)
+        msgspec.structs.force_setattr(self, 'lookup', lookup)
+        super().__post_init__()
+
+
+_CaptureMapScalarType = Union[float, int, str, bool, None]
+_AdjustSourceCapturesMap = dict[str, Union[CaptureRemap, _CaptureMapScalarType]]
+_AdjustSourceCapturesTup = tuple[str, Union[CaptureRemap, _CaptureMapScalarType]]
+AdjustCapturesType = dict[
+    Union[types.SourceID, Literal['defaults']],
+    Union[_AdjustSourceCapturesMap, _AdjustSourceCapturesTup],
+]
+
+
+@sa.util.lru_cache()
+def _validate_loops(loops: tuple[LoopSpec, ...]):
+    from collections import Counter
+
+    if len(loops) == 0:
+        return
+
+    if loops[0].field is None:
+        named_loops = loops[1:]
+    else:
+        named_loops = loops
+
+    counts = Counter(l.field for l in named_loops)
+
+    if None in counts:
+        raise msgspec.ValidationError('a repeat may only be the outermost (first) loop')
+
+    common = counts.most_common(1)
+
+    if len(common) == 0:
+        return
+
+    (which, howmany), *_ = common
+    if howmany > 1:
+        raise msgspec.ValidationError(
+            f'more than one loop specified for capture field {which!r}'
+        )
+
+
+class Sweep(SpecBase, Generic[SS, SP, SC], frozen=True, kw_only=True):
+    # sweep bindings also accept the following tag field in input files, which
+    # msgspec uses to determine the Sweep subclass to instantiate from e.g.
+    # yaml files.
+    #
+    # See: ./bindings.py
+    #
+    # sensor_binding: str
+
+    # metadata
+    description: Description = Description()
+    plot_hint: Union[PlotOptions, None] = None
+
+    # acquisition and sequencing
+    source: SS
+    captures: tuple[SC, ...] = tuple()
+    loops: tuple[LoopSpec, ...] = ()
+    adjust_captures: AdjustCapturesType = msgspec.field(default_factory=dict)
+    peripherals: SP = cast(SP, Peripherals())
+
+    # analysis
+    analysis: BundledAnalysis = BundledAnalysis()  # pyright: ignore
+
+    # misc
+    extensions: Extension = Extension()
+    sink: Sink = Sink()
+    options: SweepOptions = SweepOptions(reuse_iq=False, loop_only_nyquist=False)
+
+    # to be defined only when subclassing
+    schema: ClassVar[Any] = None
+    sensor: ClassVar[Any] = None
+
+    def __post_init__(self):
+        from . import helpers
+
+        # do this first, so that its result can then also be frozen
+        fixed_labels = helpers._convert_label_lookup_keys(self)
+        msgspec.structs.force_setattr(self, 'adjust_captures', fixed_labels)
+
+        super().__post_init__()
+        _validate_loops(self.loops)
+
+        if len(self.captures) > 0:
+            coord_fields = set(self.captures[0].__struct_fields__)
+        elif self.schema is not None:
+            coord_fields = set(self.schema.capture.__struct_fields__)
+        else:
+            coord_fields = None
+
+        if coord_fields is not None:
+            invalid = set(self.analysis.__struct_fields__) & coord_fields
+            if len(invalid) > 0:
+                raise AttributeError(
+                    f'capture fields {tuple(invalid)} conflict with measurements of the same name'
+                )
+
+
+class CalibrationSweep(
+    Sweep[SS, SP, SC],
+    Generic[SS, SP, SC, SPC],
+    frozen=True,
+    kw_only=True,
+):
+    """This specialized sweep is fed to the YAML file loader
+    to specify the change in expected capture structure."""
+
+    options: SweepOptions = SweepOptions(
+        skip_warmup=True, reuse_iq=True, loop_only_nyquist=True
+    )
+    calibration: Union[SPC, None] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if len(self.captures) > 1:
+            raise TypeError(
+                'calibration sweeps may specify loops but not captures, only loops'
+            )
+        if self.source.calibration is not None:
+            raise ValueError('source.calibration must be None for a calibration sweep')
+
+
+# %% Non-Sweep specs
+# we really only need a dataclass for internal message-passing.
+# instead, use msgspec.Struct as dataclass here in order to support
+# kw_only=True for python < 3.10.
+#
+# this does not perform validation, which is left to type-checking for this
+# internal message passing
+class AcquisitionInfo(msgspec.Struct, kw_only=True, frozen=True):
+    """information about an acquired acquisition"""
+
+    # duck-type methods and structure of SpecBase
+
+    source_id: types.SourceID = ''
+    sweep_index: Union[int, None] = None
+    capture_index: int = 0
+
+    def replace(self, **attrs) -> _Self:
+        """returns a copy of self with changed attributes.
+
+        See also:
+            Python standard library `copy.replace`
+        """
+        return msgspec.structs.replace(self, **attrs)
+
+    def to_dict(self) -> dict:
+        """return a dictinary representation of `self`"""
+        return msgspec.structs.asdict(self)
+
+    @classmethod
+    def from_dict(cls: type[_T], d: dict) -> _T:
+        return cls(**d)
+
+
+class SoapyAcquisitionInfo(AcquisitionInfo, kw_only=True, frozen=True):
+    """extra coordinate information returned from an acquisition"""
+
+    sweep_start_time: types.SweepStartTime | None = None
+    start_time: types.StartTime | None
+    backend_sample_rate: Optional[types.BackendSampleRate]
+    source_id: types.SourceID = ''
+
+
+class FileAcquisitionInfo(AcquisitionInfo, kw_only=True, frozen=True):
+    center_frequency: types.CenterFrequency = float('nan')
+    backend_sample_rate: types.BackendSampleRate
+    port: types.Port = 0
+    gain: types.Gain = float('nan')
+    source_id: types.SourceID = ''
+
+
+class SourceInfo(SpecBase, kw_only=True, frozen=True, cache_hash=True):
+    num_rx_ports: Union[int, None]
+    retries: Union[int, None] = None
+
+    def min_port_count(self, tuple_size: int):
+        if self.num_rx_ports is None:
+            return tuple_size
+        else:
+            return self.num_rx_ports

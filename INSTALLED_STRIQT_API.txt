@@ -1,0 +1,27 @@
+['AnalysisRegistry', 'Capture', 'EvaluationOptions', 'Trigger', 'analyze_by_spec', 'cellular_5g_pss_correlation', 'cellular_5g_pss_sync', 'cellular_5g_ssb_spectrogram', 'cellular_5g_sss_correlation', 'cellular_cyclic_autocorrelation', 'cellular_resource_power_histogram', 'channel_power_histogram', 'channel_power_time_series', 'cyclic_channel_power', 'dBlinmean', 'dBlinsum', 'dBtopow', 'dataarrays', 'dump', 'envtodB', 'envtopow', 'io', 'iq_waveform', 'lib', 'load', 'measurements', 'open_store', 'power_spectral_density', 'powtodB', 'register', 'registry', 'shared', 'source', 'specs', 'spectrogram', 'spectrogram_histogram', 'spectrogram_ratio_histogram', 'typing', 'util']
+def evaluate_spectrogram(
+    iq: Array,
+    capture: specs.Capture,
+    spec: specs.Spectrogram,
+    *,
+    dtype: Union[Literal['float16'], Literal['float32']] = 'float32',
+    limit_digits: Optional[int] = None,
+    dB=True,
+) -> tuple[Array, dict]:
+    spg, attrs = _cached_spectrogram(iq, capture, spec=spec)
+    xp = sw.array_namespace(iq)
+    copied = False
+    if dB:
+        spg = sw.powtodB(spg, eps=1e-25)
+        copied = True
+    if limit_digits is not None:
+        spg = xp.round(spg, limit_digits, out=spg if copied else None)
+        copied = True
+    if dtype == 'float16':
+        spg = spg.astype(dtype, copy=not copied)
+    attrs = attrs | {'limit_digits': limit_digits}
+    return spg, attrs
+from .structs import *
+from . import types, helpers
+from .types import Meta
+from .helpers import frozendict
