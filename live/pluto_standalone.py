@@ -351,7 +351,9 @@ def make_source():
         receive_retries=0,
     )
 
-    return PlutoSource.from_spec(source_spec)
+    source = PlutoSource(source_spec)
+    source.setup()
+    return source
 
 
 def make_capture(cfg):
