@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
 """
-PlutoSDR live spectrogram + PSD viewer -- single machine, no network.
+PlutoSDR version of live spectrogram + PSD viewer -- single machine, no network.
 
-Adapted from striqt_standalone.py (AIR8201 version) for use with an
-ADALM-Pluto (single-RX) on a Raspberry Pi 5.  The striqt library and
-deepwave.py are untouched.  The PlutoSource adapter below routes around
-the AIR-T-specific JESD FPGA register write and uses driver='plutosdr'.
-
-Hardware notes vs the AIR-T original:
-  - CHANNELS = (0,)  -- standard Pluto is single-RX
-  - Pluto gain is 0..73 dB positive (AIR-T was -30..0 dB attenuation);
-    the gain spinbox range in _controls() still shows the AIR-T defaults
-    as a reminder -- update them once you know your operating point.
-  - USB 2.0 limits Pluto to ~5 MS/s sustained; prefer <= 3.84 MS/s.
-  - 125 MHz master clock (MASTER_CLOCK_RATE) may be silently clamped or
-    ignored by SoapyPlutoSDR -- the driver picks the BBPLL internally.
 """
 
 import csv
