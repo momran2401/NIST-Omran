@@ -2,9 +2,8 @@
 """
 Standalone AIR8201 live spectrogram + PSD viewer -- single machine, no network.
 
-This merges the striqt radio backend (airt_live_server_striqt.py) and
-the Qt viewer UI (finalviewer.py) into one process. There is NO TCP:
-no socket, no server/client, no JSON wire protocol.
+Merges the radio backend (airt_live_server_striqt.py) and
+the Qt viewer UI (finalviewer.py) into one process.
 """
 
 import csv
