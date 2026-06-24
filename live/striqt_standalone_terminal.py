@@ -2,8 +2,7 @@
 """
 Terminal interface AIR8201 live spectrogram + PSD monitor.
 
-This is intentionally separate from airt_live_standalone.py and does not import
-Qt, pyqtgraph, or any GUI package. It is meant to run over plain SSH.
+Meant to run over plain SSH.
 
 Example:
     python live/airt_live_terminal.py --center-mhz 1955 --rate-msps 15.36 \
