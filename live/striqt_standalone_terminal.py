@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Terminal-only AIR8201 live spectrogram + PSD monitor.
+Terminal interface AIR8201 live spectrogram + PSD monitor.
 
 This is intentionally separate from airt_live_standalone.py and does not import
 Qt, pyqtgraph, or any GUI package. It is meant to run over plain SSH.
