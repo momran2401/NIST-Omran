@@ -38,6 +38,17 @@ workflow:
     process, with no TCP server/client split.
   - Use this when the radio host can also run the GUI.
 
+- `striqt_web_server.py` + `live/web/`
+  - Browser-based live viewer accessible from anywhere.
+  - Runs on the Deepwave/AIR-T; streams spectrogram frames over WebSocket to
+    any browser (desktop, phone, tablet).
+  - Add Cloudflare Tunnel for internet access without port-forwarding.
+  - Feature parity with `striqt_standalone.py`: dual waterfalls, PSD, band
+    monitor, peak hold/marker, min trace, RX1−RX2 diff, absolute/baseband axes,
+    CSV and PNG export, Boring/Cool mode.
+  - `--demo` flag generates synthetic IQ so the web app works on a laptop
+    without any radio hardware (useful for development/testing).
+
 
 ## Quick Usage
 
@@ -61,6 +72,28 @@ Run commands from the repository root unless noted otherwise.
   ```sh
   python3 live/striqt_standalone.py
   ```
+
+- Web viewer (browser-accessible from anywhere):
+
+  ```sh
+  # Install once (on the Deepwave or your dev machine)
+  pip install fastapi 'uvicorn[standard]'
+
+  # Test on a laptop with no radio (opens at http://localhost:8000)
+  python3 live/striqt_web_server.py --demo
+
+  # Real radio, LAN-only
+  python3 live/striqt_web_server.py
+
+  # Real radio + internet access via Cloudflare Tunnel (one-step launcher)
+  bash live/run_web.sh
+
+  # Low-bandwidth option (uint8 waterfall, ~4× smaller frames)
+  bash live/run_web.sh --quantize
+  ```
+
+  After running `run_web.sh`, cloudflared prints a public
+  `*.trycloudflare.com` URL — open it on any browser.
 
 ## Notes
 

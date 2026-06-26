@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIR8201 Live Spectrogram + PSD (web simulation)</title>
+<style>
+  :root{
+    --bg:#101418; --panel:#161b22; --panel2:#1b2733; --border:#30363d;
+    --fg:#d0d0d0; --muted:#8b97a3; --accent:#ffd24a;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:13px; display:flex; flex-direction:column; overflow:hidden;
+  }
+  .mono{font-family:Menlo,Consolas,monospace}
+  header{
+    padding:6px 10px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  }
+  header h1{font-size:14px; margin:0; font-weight:600}
+  .simbadge{
+    background:#3a1d1d; color:#ff9b9b; border:1px solid #5a2a2a;
+    padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; letter-spacing:.5px;
+  }
+  .controls{padding:6px 8px; display:flex; gap:8px; flex-wrap:wrap; border-bottom:1px solid var(--border)}
+  fieldset{
+    border:1px solid var(--border); border-radius:6px; margin:0; padding:5px 8px 7px;
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  }
+  legend{font-size:11px; color:var(--muted); padding:0 4px}
+  label.lbl{color:var(--muted); font-size:12px}
+  input,select,button{
+    background:#0d1117; color:var(--fg); border:1px solid var(--border);
+    border-radius:4px; padding:3px 6px; font-size:12px;
+  }
+  input[type=number]{width:78px}
+  button{cursor:pointer}
+  button:hover{border-color:#4b5563}
+  button.toggled{background:#23425e; border-color:#3b6ea5; color:#dbeafe}
+  input[type=checkbox]{accent-color:#3b6ea5}
+  .row-chk{display:flex; align-items:center; gap:4px; font-size:12px}
+  #status{font-weight:700; padding:2px 10px}
+  #meta{padding:0 10px 4px; color:var(--muted); font-size:11.5px}
+  #band{
+    margin:4px 10px; padding:6px 8px; border-radius:4px;
+    background:var(--panel2); color:var(--accent); font-weight:700; font-size:14px;
+    font-family:Menlo,Consolas,monospace;
+  }
+  main{flex:1; display:flex; flex-direction:column; min-height:0; padding:0 10px 6px; gap:6px}
+  .specrow{display:flex; gap:8px; min-height:0; flex:1.1}
+  .pane{flex:1; min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px}
+  .pane canvas{display:block; width:100%; height:100%}
+  #psdWrap{flex:1; background:var(--panel); border:1px solid var(--border); border-radius:6px; min-height:0}
+  #psd{display:block; width:100%; height:100%}
+  #log{
+    height:120px; overflow:auto; background:#0d1117; color:#d0d0d0;
+    border:1px solid var(--border); border-radius:6px; padding:4px 8px;
+    font-family:Menlo,Consolas,monospace; font-size:11.5px; white-space:pre; line-height:1.35;
+  }
+  .log-WARN{color:#ffd24a} .log-ERROR{color:#ff7b7b} .log-DEBUG{color:#6b7682}
+  .hint{color:var(--muted); font-size:11px; padding:0 10px 2px}
+</style>
+</head>
+<body>
+<header>
+  <h1>AIR8201 Live Spectrogram + PSD</h1>
+  <span class="simbadge">WEB SIMULATION — no radio connected</span>
+  <span id="fpsTag" class="mono" style="margin-left:auto;color:var(--muted)"></span>
+</header>
+
+<div class="controls">
+  <fieldset>
+    <legend>Radio (simulated AIR-T)</legend>
+    <label class="lbl">Center (MHz)</label>
+    <input id="center" type="number" min="300" max="6000" step="5" value="1955" >
+    <label class="lbl">Span (MS/s)</label>
+    <select id="rate">
+      <option>3.84</option><option>7.68</option>
+      <option selected>15.36</option><option>30.72</option>
+    </select>
+    <label class="lbl">Gain (dB)</label>
+    <input id="gain" type="number" min="-30" max="0" step="0.5" value="0">
+    <label class="lbl">FFT</label>
+    <select id="nfft">
+      <option>256</option><option>512</option>
+      <option selected>1024</option><option>2048</option><option>4096</option>
+    </select>
+    <button id="tune">Tune to selection</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Display</legend>
+    <button id="pause">Pause</button>
+    <label class="lbl">Mode</label>
+    <select id="mode">
+      <option value="flicker">Boring Mode 🥱</option>
+      <option value="waterfall">Cool Mode 😎</option>
+    </select>
+    <label class="lbl">Window (ms)</label>
+    <select id="window">
+      <option>10</option><option selected>20</option><option>50</option>
+      <option>100</option><option>200</option><option>500</option><option>1000</option>
+    </select>
+    <label class="lbl">JEEZ SLOW DOWN</label>
+    <select id="speed">
+      <option value="0">Off (full speed)</option>
+      <option value="15">15 fps</option><option value="8">8 fps</option>
+      <option value="4">4 fps</option><option value="2">2 fps</option><option value="1">1 fps</option>
+    </select>
+    <span class="row-chk"><input id="auto" type="checkbox" checked><label for="auto">Auto color</label></span>
+    <span class="row-chk"><input id="abs" type="checkbox" checked><label for="abs">Absolute RF</label></span>
+    <button id="reset">Reset view</button>
+    <button id="png">Export PNG</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>PSD tools</legend>
+    <span class="row-chk"><input id="diff" type="checkbox"><label for="diff">RX1−RX2 diff</label></span>
+    <span class="row-chk"><input id="peak" type="checkbox" checked><label for="peak">Peak marker</label></span>
+    <span class="row-chk"><input id="hold" type="checkbox"><label for="hold">Peak hold</label></span>
+    <button id="clearhold">Clear hold</button>
+    <span class="row-chk"><input id="min" type="checkbox"><label for="min">Min trace</label></span>
+    <span class="row-chk"><input id="cross" type="checkbox" checked><label for="cross">Crosshair</label></span>
+  </fieldset>
+</div>
+
+<div id="status">starting ...</div>
+<div id="meta"></div>
+<div id="band">Band monitor: --</div>
+<div class="hint">Drag the green band edges on the PSD to set the measurement band, then “Tune to selection” to retune the simulated radio there.</div>
+
+<main>
+  <div class="specrow">
+    <div class="pane"><canvas id="spec0"></canvas></div>
+    <div class="pane"><canvas id="spec1"></canvas></div>
+  </div>
+  <div id="psdWrap"><canvas id="psd"></canvas></div>
+  <div id="log"></div>
+</main>
+
+<script>
+"use strict";
+/* ============================================================================
+ * AIR8201 standalone viewer — WEB SIMULATION
+ * Mirrors live/striqt_standalone.py (PyQt5 + pyqtgraph) with synthetic IQ.
+ * The radio backend is replaced by a synthetic scene of cellular-band emitters;
+ * everything downstream (spectrogram, PSD, band monitor, controls) behaves like
+ * the real viewer.
+ * ==========================================================================*/
+
+// ---- constants mirrored from the Python module --------------------------
+const CHANNELS = [0, 1];
+const MAX_LIVE_ROWS = 300;      // live GUI stability cap
+const MAX_ROWS = 20000;
+const SCROLL_ROWS = 12;         // rows/frame in waterfall (Cool) mode
+const PSD_YRANGE = [-80, 20];   // fixed PSD power axis (dB)
+const RADIO_FPS = 30;           // synthetic source frame rate
+const NOISE_FLOOR_DB = -78;
+
+// ---- viridis colormap LUT (256 entries) ---------------------------------
+const VIRIDIS_ANCHORS = [
+  [68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],
+  [31,158,137],[53,183,121],[110,206,88],[181,222,43],[253,231,37],[253,231,37]
+];
+const LUT = (() => {
+  const lut = new Uint8ClampedArray(256*3);
+  for(let i=0;i<256;i++){
+    const t=i/255*(VIRIDIS_ANCHORS.length-1);
+    const a=Math.floor(t), f=t-a, c0=VIRIDIS_ANCHORS[a], c1=VIRIDIS_ANCHORS[Math.min(a+1,VIRIDIS_ANCHORS.length-1)];
+    lut[i*3]  =c0[0]+(c1[0]-c0[0])*f;
+    lut[i*3+1]=c0[1]+(c1[1]-c0[1])*f;
+    lut[i*3+2]=c0[2]+(c1[2]-c0[2])*f;
+  }
+  return lut;
+})();
+
+// ---- synthetic RF scene (absolute frequency, MHz) -----------------------
+// Each emitter contributes power over a frequency span; the visible window is
+// whatever falls inside [center - fs/2, center + fs/2]. RX2 gets a small
+// per-emitter offset so the two channels (and the directivity Δ) differ.
+const EMITTERS = [
+  {f:1947.5, bw:9.0, p:-34, type:'lte',    d2:-2.0},
+  {f:1957.5, bw:4.5, p:-31, type:'lte',    d2: 1.5},
+  {f:1962.3, bw:0.18,p:-22, type:'tone',   d2:-1.0},
+  {f:1951.0, bw:1.4, p:-40, type:'lte',    d2: 0.5},
+  {f:1966.0, bw:3.0, p:-37, type:'bursty', d2:-3.0},
+  {f:1939.0, bw:5.0, p:-39, type:'lte',    d2: 2.0},
+  {f:1971.0, bw:1.0, p:-44, type:'bursty', d2: 0.0},
+  {f:1925.0, bw:8.0, p:-42, type:'lte',    d2:-1.5},
+  {f:1980.0, bw:10.0,p:-40, type:'lte',    d2: 1.0},
+  {f:1909.0, bw:0.2, p:-46, type:'tone',   d2: 0.0},
+  {f:1995.0, bw:5.0, p:-43, type:'lte',    d2:-2.0},
+];
+// per-emitter animation phase/state
+EMITTERS.forEach((e,i)=>{ e.ph=i*1.7; e.rate=0.4+0.25*Math.sin(i); e.on=true; e.next=0; });
+
+// ---- state (mirrors RadioConfig + viewer flags) -------------------------
+const S = {
+  center: 1955e6, fs: 15.36e6, gain: 0.0, nfft: 1024, rows: 300,
+  windowMs: 20, mode: 'flicker', paused: false, autoColor: true, absolute: true,
+  minInterval: 0, // seconds between renders (0 = full)
+  diff:false, peakMarker:true, peakHold:false, showMin:false, crosshair:true,
+  levels:[-90,-10], fps:0, frames:0, tFps:performance.now(),
+  lastRender:0, hold:[null,null],
+  regionLo:null, regionHi:null,        // measurement band (display MHz units)
+  cursor:null,                          // {x,y} in PSD data coords
+};
+
+// rolling buffers: buffers[ch] = array of Float32Array(nfft), index 0 = newest
+let buffers = [null, null];
+let freqsMHz = null;                    // x axis (display units) length nfft
+let baseLin = [null, null];             // static linear power profile per channel
+let emitBins = [];                      // [{e, lo, hi}] emitter bin ranges in window
+let geomKey = '';
+
+// ---- helpers ------------------------------------------------------------
+function rowsForWindow(fs, nfft){
+  let rows = Math.round(S.windowMs/1000 * fs / nfft);
+  rows = Math.max(1, Math.min(rows, MAX_ROWS));
+  const capped = Math.min(rows, MAX_LIVE_ROWS);
+  if(capped !== rows) logEvent(`rows capped from ${rows} to ${capped} for live stability`, "WARN");
+  return capped;
+}
+function fmtCfg(key,v){
+  if(key==='center'||key==='sample_rate') return (v/1e6).toFixed(3)+"e6";
+  if(key==='gain') return (+v).toFixed(1);
+  return String(Math.round(v));
+}
+let _rng = 0x9e3779b9;
+function rand(){ // xorshift, fast
+  _rng ^= _rng<<13; _rng ^= _rng>>>17; _rng ^= _rng<<5;
+  return ((_rng>>>0)/4294967296);
+}
+function randn(){ return (rand()+rand()+rand()-1.5)*1.8; } // approx gaussian-ish
+
+// ---- DOM ----------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const logEl=$("log"), statusEl=$("status"), metaEl=$("meta"), bandEl=$("band"), fpsTag=$("fpsTag");
+function logEvent(msg, level="INFO"){
+  const ts=new Date().toTimeString().slice(0,8);
+  const line=document.createElement("div");
+  line.className="log-"+level;
+  line.textContent=`[${ts}] ${level.padEnd(5)} ${msg}`;
+  logEl.appendChild(line);
+  while(logEl.childNodes.length>400) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop=logEl.scrollHeight;
+  if(level==="WARN"||level==="ERROR") statusEl.textContent=msg;
+}
+function setStatus(s){ statusEl.textContent=s; }
+
+// =========================================================================
+//  geometry + synthetic signal model
+// =========================================================================
+function freqAxisMHz(){
+  const n=S.nfft, out=new Float64Array(n);
+  for(let i=0;i<n;i++){
+    const base=(i-n/2)*(S.fs/n);                 // fftshift(fftfreq) baseband Hz
+    out[i]=(S.absolute ? S.center+base : base)/1e6;
+  }
+  return out;
+}
+function emitterLinAt(e, fMHz, ch){
+  // linear power contribution of one emitter at frequency fMHz (display abs MHz)
+  const absMHz = S.absolute ? fMHz : (S.center/1e6 + fMHz);
+  const half=e.bw/2, d=absMHz-e.f, pw=e.p + (ch===1 ? e.d2 : 0) + S.gain*1.0;
+  if(e.type==='tone'){
+    const sig=Math.max(e.bw,0.02);
+    const g=Math.exp(-(d*d)/(2*sig*sig));
+    return Math.pow(10, pw/10)*g;
+  }
+  // lte / bursty: flat top with raised-cosine edges + slight RB ripple
+  if(absMHz < e.f-half || absMHz > e.f+half) return 0;
+  let shape=1, edge=half*0.12;
+  if(half-Math.abs(d) < edge) shape=0.5*(1-Math.cos(Math.PI*(half-Math.abs(d))/edge));
+  const ripple=1+0.06*Math.sin(absMHz*9.3);     // resource-block texture
+  return Math.pow(10, pw/10)*shape*ripple;
+}
+function rebuildGeometry(){
+  const key=`${S.center}|${S.fs}|${S.nfft}|${S.absolute}`;
+  if(key===geomKey && freqsMHz) return;
+  geomKey=key;
+  freqsMHz=freqAxisMHz();
+  const n=S.nfft, floorLin=Math.pow(10,(NOISE_FLOOR_DB+S.gain*0.5)/10);
+  for(const ch of CHANNELS){
+    const lin=new Float64Array(n);
+    for(let i=0;i<n;i++){
+      let v=floorLin;
+      for(const e of EMITTERS) v+=emitterLinAt(e, freqsMHz[i], ch);
+      lin[i]=v;
+    }
+    baseLin[ch]=lin;
+  }
+  // emitter bin ranges (for cheap per-frame animation)
+  emitBins=[];
+  for(const e of EMITTERS){
+    let lo=-1, hi=-1;
+    for(let i=0;i<n;i++){
+      const abs=S.absolute?freqsMHz[i]:(S.center/1e6+freqsMHz[i]);
+      if(abs>=e.f-e.bw/2-0.1 && abs<=e.f+e.bw/2+0.1){ if(lo<0)lo=i; hi=i; }
+    }
+    if(lo>=0) emitBins.push({e,lo,hi});
+  }
+  // ensure measurement band sits inside the window
+  const f0=freqsMHz[0], f1=freqsMHz[n-1];
+  if(S.regionLo===null || S.regionHi<=f0 || S.regionLo>=f1){
+    S.regionLo=f0+0.45*(f1-f0); S.regionHi=f0+0.55*(f1-f0);
+  }
+}
+function makeRow(ch, t, deltaDb){
+  // one FFT row in dB: base profile + emitter animation + per-bin noise + DC null
+  const n=S.nfft, base=baseLin[ch], row=new Float32Array(n);
+  let rmin=Infinity;
+  for(let i=0;i<n;i++){
+    const db=10*Math.log10(base[i]) + deltaDb[i] + randn();
+    row[i]=db; if(db<rmin) rmin=db;
+  }
+  // DC/LO leakage null: replace 5 center bins with the row minimum (as in py)
+  const c=n>>1;
+  for(let k=c-2;k<=c+2;k++) if(k>=0&&k<n) row[k]=rmin;
+  return row;
+}
+function frameDeltas(t){
+  // per-bin dB delta from emitter animation (fading + bursts)
+  const n=S.nfft, delta=new Float32Array(n);
+  for(const {e,lo,hi} of emitBins){
+    let dl;
+    if(e.type==='bursty'){
+      if(t>e.next){ e.on=!e.on; e.next=t+(e.on?0.25+rand()*0.5:0.15+rand()*0.4); }
+      dl=e.on ? (-1+2*Math.sin(t*4+e.ph)) : -28;
+    } else {
+      dl=3.0*Math.sin(t*e.rate+e.ph) + 1.5*Math.sin(t*1.9+e.ph*0.7);
+    }
+    for(let i=lo;i<=hi;i++) delta[i]+=dl;
+  }
+  return delta;
+}
+
+// =========================================================================
+//  frame generation (the synthetic "LocalReceiver")
+// =========================================================================
+function ensureBuffers(depth){
+  if(buffers[0] && buffers[0].length===depth && buffers[0][0].length===S.nfft) return;
+  for(const ch of CHANNELS){
+    buffers[ch]=Array.from({length:depth},()=>new Float32Array(S.nfft).fill(-150));
+  }
+  S.hold=[null,null];
+}
+function generateFrame(t){
+  rebuildGeometry();
+  const depth = S.mode==='flicker'
+    ? Math.min(rowsForWindow(S.fs,S.nfft), MAX_ROWS)
+    : rowsForWindow(S.fs,S.nfft);
+  ensureBuffers(depth);
+
+  if(S.mode==='flicker'){
+    for(const ch of CHANNELS){
+      const buf=buffers[ch];
+      for(let r=0;r<depth;r++){
+        // each row is a slightly earlier moment; newest at index 0 (top)
+        const delta=frameDeltas(t - r/RADIO_FPS*0.6);
+        buf[r]=makeRow(ch, t, delta);
+      }
+    }
+  } else {
+    const m=Math.min(SCROLL_ROWS, depth);
+    for(const ch of CHANNELS){
+      const buf=buffers[ch];
+      for(let k=m-1;k>=0;k--){
+        const delta=frameDeltas(t - k/RADIO_FPS);
+        buf.unshift(makeRow(ch, t, delta));
+      }
+      buf.length=depth;          // drop oldest rows off the bottom
+    }
+  }
+}
+
+// =========================================================================
+//  rendering: spectrograms
+// =========================================================================
+const panes=[{cv:$("spec0"),title:"Spectrogram Port 0 — RX1"},
+             {cv:$("spec1"),title:"Spectrogram Port 1 — RX2"}];
+panes.forEach(p=>{ p.ctx=p.cv.getContext("2d"); p.off=document.createElement("canvas"); p.offctx=p.off.getContext("2d"); });
+const psdCv=$("psd"), psdCtx=psdCv.getContext("2d");
+
+function sizeCanvas(cv){
+  const r=cv.getBoundingClientRect(), dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=Math.max(50,Math.round(r.width*dpr)), h=Math.max(50,Math.round(r.height*dpr));
+  if(cv.width!==w||cv.height!==h){ cv.width=w; cv.height=h; }
+  return dpr;
+}
+function computeLevels(){
+  if(!S.autoColor || !buffers[0]) return;
+  // sub-sample like the py viewer (rows step 3, cols step 4) and take pct 5/99
+  const samp=[];
+  for(const ch of CHANNELS){
+    const buf=buffers[ch];
+    for(let r=0;r<buf.length;r+=3){ const row=buf[r]; for(let i=0;i<row.length;i+=4) samp.push(row[i]); }
+  }
+  samp.sort((a,b)=>a-b);
+  const q=p=>samp[Math.min(samp.length-1,Math.max(0,Math.floor(p*samp.length)))];
+  let vmin=q(0.05), vmax=q(0.99);
+  if(vmax-vmin<5) vmax=vmin+5;
+  S.levels=[vmin,vmax];
+}
+function renderSpectrogram(p, ch){
+  const ctx=p.ctx, dpr=sizeCanvas(p.cv), W=p.cv.width, H=p.cv.height;
+  ctx.fillStyle="#101418"; ctx.fillRect(0,0,W,H);
+  if(!buffers[ch]){ return; }
+  const buf=buffers[ch], depth=buf.length, n=S.nfft;
+  const L=46*dpr, R=10*dpr, T=22*dpr, B=30*dpr;
+  const pw=W-L-R, ph=H-T-B;
+
+  // offscreen image at native n x depth, then scaled into the plot rect
+  if(p.off.width!==n||p.off.height!==depth){ p.off.width=n; p.off.height=depth; }
+  const img=p.offctx.createImageData(n,depth);
+  const data=img.data, [vmin,vmax]=S.levels, inv=1/Math.max(1e-9,vmax-vmin);
+  let o=0;
+  for(let r=0;r<depth;r++){
+    const row=buf[r];
+    for(let i=0;i<n;i++){
+      let tcol=(row[i]-vmin)*inv; tcol=tcol<0?0:tcol>1?1:tcol;
+      const li=(tcol*255)|0, li3=li*3;
+      data[o++]=LUT[li3]; data[o++]=LUT[li3+1]; data[o++]=LUT[li3+2]; data[o++]=255;
+    }
+  }
+  p.offctx.putImageData(img,0,0);
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(p.off, 0,0,n,depth, L,T,pw,ph);
+
+  // frame + labels
+  ctx.strokeStyle="#30363d"; ctx.lineWidth=1; ctx.strokeRect(L,T,pw,ph);
+  ctx.fillStyle="#d0d0d0"; ctx.textBaseline="alphabetic";
+  ctx.font=`${12*dpr}px -apple-system,sans-serif`;
+  ctx.textAlign="left"; ctx.fillText(p.title, L, T-7*dpr);
+
+  // frequency ticks
+  ctx.font=`${10*dpr}px Menlo,monospace`; ctx.fillStyle="#9aa4ad"; ctx.textAlign="center";
+  const f0=freqsMHz[0], f1=freqsMHz[n-1], dec=(f1-f0)<2?3:(f1-f0)<20?2:1;
+  for(let k=0;k<=6;k++){
+    const fx=f0+(f1-f0)*k/6, x=L+pw*k/6;
+    ctx.strokeStyle="rgba(255,255,255,0.08)"; ctx.beginPath(); ctx.moveTo(x,T); ctx.lineTo(x,T+ph); ctx.stroke();
+    ctx.fillText(fx.toFixed(dec), x, T+ph+14*dpr);
+  }
+  ctx.fillStyle="#9aa4ad"; ctx.fillText("Frequency (MHz)", L+pw/2, H-4*dpr);
+
+  // time ticks (0 = now at top)
+  const tMs=depth*n/S.fs*1e3;
+  ctx.textAlign="right";
+  for(let k=0;k<=4;k++){
+    const y=T+ph*k/4, tv=tMs*k/4;
+    ctx.strokeStyle="rgba(255,255,255,0.08)"; ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(L+pw,y); ctx.stroke();
+    ctx.fillText(tv.toFixed(tMs<10?2:0), L-5*dpr, y+3*dpr);
+  }
+  ctx.save(); ctx.translate(11*dpr,T+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.textAlign="center"; ctx.fillStyle="#9aa4ad"; ctx.fillText("Time (ms)",0,0); ctx.restore();
+
+  // colorbar
+  const cbX=L+pw+ (R<14*dpr?0:0); // keep inside; draw thin bar at right edge
+  const bx=W-9*dpr, bw=6*dpr;
+  for(let yy=0;yy<ph;yy++){
+    const tcol=1-yy/ph, li=(tcol*255)|0, li3=li*3;
+    ctx.fillStyle=`rgb(${LUT[li3]},${LUT[li3+1]},${LUT[li3+2]})`;
+    ctx.fillRect(bx,T+yy,bw,1);
+  }
+  ctx.strokeStyle="#30363d"; ctx.strokeRect(bx,T,bw,ph);
+}
+
+// =========================================================================
+//  rendering: PSD
+// =========================================================================
+function colMean(buf,i){ let s=0; for(let r=0;r<buf.length;r++) s+=buf[r][i]; return s/buf.length; }
+function colMax(buf,i){ let m=-Infinity; for(let r=0;r<buf.length;r++) if(buf[r][i]>m)m=buf[r][i]; return m; }
+function colMin(buf,i){ let m=Infinity; for(let r=0;r<buf.length;r++) if(buf[r][i]<m)m=buf[r][i]; return m; }
+
+function reduceCols(buf, fn){ const n=S.nfft, out=new Float32Array(n); for(let i=0;i<n;i++) out[i]=fn(buf,i); return out; }
+
+let psdGeom=null;
+function renderPSD(){
+  const dpr=sizeCanvas(psdCv), W=psdCv.width, H=psdCv.height;
+  psdCtx.fillStyle="#101418"; psdCtx.fillRect(0,0,W,H);
+  if(!buffers[0]||!freqsMHz) return;
+  const L=58*dpr,R=14*dpr,T=24*dpr,B=34*dpr, pw=W-L-R, ph=H-T-B;
+  const f0=freqsMHz[0], f1=freqsMHz[S.nfft-1];
+
+  const m0=reduceCols(buffers[0],colMean), x0=reduceCols(buffers[0],colMax);
+  const m1=reduceCols(buffers[1],colMean), x1=reduceCols(buffers[1],colMax);
+
+  let yLo=PSD_YRANGE[0], yHi=PSD_YRANGE[1];
+  if(S.diff){
+    let lo=Infinity,hi=-Infinity;
+    for(let i=0;i<S.nfft;i++){ const d=m0[i]-m1[i]; if(d<lo)lo=d; if(d>hi)hi=d; }
+    const pad=(hi-lo)*0.15+1; yLo=lo-pad; yHi=hi+pad;
+  }
+  const fx=f=>L+pw*(f-f0)/(f1-f0||1);
+  const fy=p=>T+ph*(1-(p-yLo)/(yHi-yLo||1));
+  psdGeom={L,R,T,B,pw,ph,f0,f1,fx,fy,yLo,yHi,dpr,W,H};
+
+  // grid
+  psdCtx.strokeStyle="rgba(255,255,255,0.10)"; psdCtx.lineWidth=1;
+  psdCtx.fillStyle="#9aa4ad"; psdCtx.font=`${10*dpr}px Menlo,monospace`;
+  psdCtx.textAlign="right"; psdCtx.textBaseline="middle";
+  for(let k=0;k<=5;k++){
+    const pv=yLo+(yHi-yLo)*k/5, y=fy(pv);
+    psdCtx.beginPath(); psdCtx.moveTo(L,y); psdCtx.lineTo(L+pw,y); psdCtx.stroke();
+    psdCtx.fillText(pv.toFixed(0), L-6*dpr, y);
+  }
+  const dec=(f1-f0)<2?3:(f1-f0)<20?2:1;
+  psdCtx.textAlign="center"; psdCtx.textBaseline="top";
+  for(let k=0;k<=6;k++){
+    const f=f0+(f1-f0)*k/6, x=fx(f);
+    psdCtx.beginPath(); psdCtx.moveTo(x,T); psdCtx.lineTo(x,T+ph); psdCtx.stroke();
+    psdCtx.fillText(f.toFixed(dec), x, T+ph+5*dpr);
+  }
+  psdCtx.strokeStyle="#30363d"; psdCtx.strokeRect(L,T,pw,ph);
+  psdCtx.fillStyle="#d0d0d0"; psdCtx.textAlign="left"; psdCtx.textBaseline="alphabetic";
+  psdCtx.font=`${12*dpr}px -apple-system,sans-serif`;
+  psdCtx.fillText("Power Spectral Density (RX1 + RX2)", L, T-8*dpr);
+  psdCtx.fillStyle="#9aa4ad"; psdCtx.font=`${10*dpr}px Menlo`;
+  psdCtx.textAlign="center"; psdCtx.fillText("Frequency (MHz)", L+pw/2, H-4*dpr);
+
+  function curve(arr, color, width, dash){
+    psdCtx.save(); psdCtx.beginPath();
+    psdCtx.strokeStyle=color; psdCtx.lineWidth=width*dpr;
+    if(dash) psdCtx.setLineDash(dash.map(v=>v*dpr));
+    psdCtx.beginPath();
+    for(let i=0;i<S.nfft;i++){
+      const x=fx(freqsMHz[i]), y=fy(arr[i]);
+      i?psdCtx.lineTo(x,y):psdCtx.moveTo(x,y);
+    }
+    psdCtx.stroke(); psdCtx.restore();
+  }
+
+  // measurement band (green edges)
+  if(S.regionLo!==null){
+    const xa=fx(S.regionLo), xb=fx(S.regionHi);
+    psdCtx.fillStyle="rgba(120,255,160,0.06)"; psdCtx.fillRect(xa,T,xb-xa,ph);
+    psdCtx.strokeStyle="rgb(120,255,160)"; psdCtx.lineWidth=2*dpr;
+    psdCtx.beginPath(); psdCtx.moveTo(xa,T); psdCtx.lineTo(xa,T+ph);
+    psdCtx.moveTo(xb,T); psdCtx.lineTo(xb,T+ph); psdCtx.stroke();
+  }
+
+  if(S.diff){
+    const d=new Float32Array(S.nfft); for(let i=0;i<S.nfft;i++) d[i]=m0[i]-m1[i];
+    curve(d,"rgb(235,235,235)",2);
+    legend(psdGeom,[["RX1-RX2 (dB)","rgb(235,235,235)"]]);
+    drawCrosshair(); return;
+  }
+
+  if(S.showMin){
+    curve(reduceCols(buffers[0],colMin),"rgba(80,220,220,0.55)",1,[2,3]);
+    curve(reduceCols(buffers[1],colMin),"rgba(255,150,70,0.55)",1,[2,3]);
+  }
+  if(S.peakHold){
+    S.hold[0]=S.hold[0]&&S.hold[0].length===x0.length?S.hold[0].map((v,i)=>Math.max(v,x0[i])):x0.slice();
+    S.hold[1]=S.hold[1]&&S.hold[1].length===x1.length?S.hold[1].map((v,i)=>Math.max(v,x1[i])):x1.slice();
+    curve(S.hold[0],"rgba(80,220,220,0.43)",1,[6,4]);
+    curve(S.hold[1],"rgba(255,150,70,0.43)",1,[6,4]);
+  }
+  curve(m0,"rgb(80,220,220)",2);   // RX1 mean cyan
+  curve(x0,"rgb(245,215,80)",2);   // RX1 max yellow
+  curve(m1,"rgb(255,150,70)",2);   // RX2 mean orange
+  curve(x1,"rgb(235,120,235)",2);  // RX2 max magenta
+
+  // peak marker on RX1 max
+  if(S.peakMarker){
+    let pi=0; for(let i=1;i<S.nfft;i++) if(x0[i]>x0[pi]) pi=i;
+    const px=fx(freqsMHz[pi]), py=fy(x0[pi]);
+    psdCtx.fillStyle="rgb(245,215,80)"; psdCtx.strokeStyle="#000"; psdCtx.lineWidth=1*dpr;
+    psdCtx.beginPath(); psdCtx.arc(px,py,5*dpr,0,7); psdCtx.fill(); psdCtx.stroke();
+    psdCtx.fillStyle="rgb(245,215,80)"; psdCtx.textAlign="center"; psdCtx.textBaseline="bottom";
+    psdCtx.font=`${10*dpr}px Menlo`;
+    psdCtx.fillText(`${freqsMHz[pi].toFixed(dec)} MHz  ${x0[pi].toFixed(1)} dB`, px, py-8*dpr);
+  }
+
+  legend(psdGeom,[
+    ["RX1 Mean","rgb(80,220,220)"],["RX1 Max","rgb(245,215,80)"],
+    ["RX2 Mean","rgb(255,150,70)"],["RX2 Max","rgb(235,120,235)"]]);
+  drawCrosshair();
+}
+function legend(g,items){
+  const {L,T,dpr}=g; let y=T+8*dpr;
+  psdCtx.font=`${10*dpr}px Menlo`; psdCtx.textAlign="left"; psdCtx.textBaseline="middle";
+  for(const [name,col] of items){
+    psdCtx.strokeStyle=col; psdCtx.lineWidth=2*dpr;
+    psdCtx.beginPath(); psdCtx.moveTo(L+8*dpr,y); psdCtx.lineTo(L+26*dpr,y); psdCtx.stroke();
+    psdCtx.fillStyle="#c7ccd1"; psdCtx.fillText(name, L+30*dpr, y);
+    y+=14*dpr;
+  }
+}
+function drawCrosshair(){
+  if(!S.crosshair||!S.cursor||!psdGeom) return;
+  const {L,T,pw,ph,fx,fy,dpr}=psdGeom, x=fx(S.cursor.x), y=fy(S.cursor.y);
+  if(x<L||x>L+pw||y<T||y>T+ph) return;
+  psdCtx.save(); psdCtx.setLineDash([4*dpr,4*dpr]); psdCtx.strokeStyle="rgba(150,150,150,0.9)"; psdCtx.lineWidth=1*dpr;
+  psdCtx.beginPath(); psdCtx.moveTo(x,T); psdCtx.lineTo(x,T+ph); psdCtx.moveTo(L,y); psdCtx.lineTo(L+pw,y); psdCtx.stroke();
+  psdCtx.setLineDash([]); psdCtx.fillStyle="#d2d2d2"; psdCtx.textAlign="left"; psdCtx.textBaseline="bottom";
+  psdCtx.font=`${10*dpr}px Menlo`;
+  psdCtx.fillText(`${S.cursor.x.toFixed(3)} MHz, ${S.cursor.y.toFixed(1)} dB`, x+5*dpr, y-3*dpr);
+  psdCtx.restore();
+}
+
+// =========================================================================
+//  band monitor (replicates _update_band)
+// =========================================================================
+function updateBand(){
+  if(!freqsMHz||!buffers[0]){ bandEl.textContent="Band monitor: --"; return; }
+  const lo=Math.min(S.regionLo,S.regionHi), hi=Math.max(S.regionLo,S.regionHi);
+  let nb=0; const mask=[];
+  for(let i=0;i<S.nfft;i++){ const m=freqsMHz[i]>=lo&&freqsMHz[i]<=hi; mask.push(m); if(m)nb++; }
+  if(nb===0){ bandEl.textContent=`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz: no bins in range`; return; }
+  const band={}, qual={};
+  for(const ch of CHANNELS){
+    const buf=buffers[ch]; let sumAll=0, sumBand=0, cAll=0;
+    const lin=new Float64Array(S.nfft);
+    for(let i=0;i<S.nfft;i++){
+      let s=0; for(let r=0;r<buf.length;r++) s+=Math.pow(10,buf[r][i]/10);
+      lin[i]=s/buf.length; sumAll+=lin[i]; cAll++;
+      if(mask[i]) sumBand+=lin[i];
+    }
+    band[ch]=10*Math.log10(sumBand/nb);
+    qual[ch]=band[ch]-10*Math.log10(sumAll/cAll);
+  }
+  const seg=[`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${nb} bins)`,
+    `RX1 ${band[0].toFixed(1)} dB`, `RX2 ${band[1].toFixed(1)} dB`,
+    `Δ ${(band[0]-band[1]>=0?"+":"")}${(band[0]-band[1]).toFixed(1)} dB`,
+    `Q RX1 ${(qual[0]>=0?"+":"")}${qual[0].toFixed(1)} RX2 ${(qual[1]>=0?"+":"")}${qual[1].toFixed(1)} dB`];
+  bandEl.textContent=seg.join("   |   ");
+}
+
+// =========================================================================
+//  meta line
+// =========================================================================
+function updateMeta(live){
+  const depth=buffers[0]?buffers[0].length:0;
+  const winMs=depth?depth*S.nfft/S.fs*1e3:0;
+  metaEl.textContent=
+    `${live?"LIVE":"PAUSED"} | center ${(S.center/1e6).toFixed(3)} MHz | `+
+    `span ${(S.fs/1e6).toFixed(2)} MS/s | gain ${S.gain.toFixed(1)} dB | `+
+    `FFT ${S.nfft} | ${S.mode} | window ${winMs.toFixed(0)} ms (${depth} rows) | `+
+    `scale ${S.autoColor?"auto":"manual"} [${S.levels[0].toFixed(0)},${S.levels[1].toFixed(0)}] | `+
+    `${S.absolute?"absolute RF":"baseband"} | ${S.fps.toFixed(0)} fps`;
+  fpsTag.textContent=`${S.fps.toFixed(0)} fps`;
+}
+
+// =========================================================================
+//  main loop
+// =========================================================================
+let t0=performance.now();
+function tick(){
+  const now=performance.now();
+  if(!S.paused){
+    if(!(S.minInterval>0 && (now-S.lastRender)/1000<S.minInterval)){
+      S.lastRender=now;
+      const t=(now-t0)/1000;
+      generateFrame(t);
+      computeLevels();
+      renderSpectrogram(panes[0],0);
+      renderSpectrogram(panes[1],1);
+      renderPSD();
+      updateBand();
+      // fps (rendered frames)
+      S.frames++;
+      if(now-S.tFps>=1000){ S.fps=S.frames*1000/(now-S.tFps); S.frames=0; S.tFps=now; }
+      updateMeta(true);
+    }
+  } else {
+    updateMeta(false);
+  }
+}
+setInterval(tick, 1000/RADIO_FPS);
+
+// =========================================================================
+//  controls
+// =========================================================================
+function applyChange(label,key,oldv,newv){
+  logEvent(`config changed (${label}): ${key} ${fmtCfg(key,oldv)} -> ${fmtCfg(key,newv)}`,"INFO");
+}
+$("center").addEventListener("change",e=>{
+  const v=Math.max(300,Math.min(6000,+e.target.value))*1e6;
+  if(v!==S.center){ applyChange("radio","center",S.center,v); S.center=v; geomKey=""; }
+});
+$("rate").addEventListener("change",e=>{
+  const v=parseFloat(e.target.value)*1e6;
+  if(v!==S.fs){ applyChange("radio","sample_rate",S.fs,v); S.fs=v;
+    S.rows=rowsForWindow(S.fs,S.nfft); geomKey=""; buffers=[null,null]; }
+});
+$("gain").addEventListener("change",e=>{
+  const v=Math.max(-30,Math.min(0,+e.target.value));
+  if(v!==S.gain){ applyChange("radio","gain",S.gain,v); S.gain=v; geomKey=""; }
+});
+$("nfft").addEventListener("change",e=>{
+  const v=parseInt(e.target.value,10);
+  if(v!==S.nfft){ applyChange("analysis/display","nfft",S.nfft,v); S.nfft=v;
+    S.rows=rowsForWindow(S.fs,S.nfft); geomKey=""; buffers=[null,null]; }
+});
+$("window").addEventListener("change",e=>{
+  const ms=Math.max(5,Math.min(60000,parseInt(e.target.value,10)));
+  S.windowMs=ms; buffers=[null,null];
+  logEvent(`window set to ${ms} ms`,"INFO");
+});
+$("mode").addEventListener("change",e=>{ S.mode=e.target.value; buffers=[null,null];
+  logEvent(`mode -> ${S.mode==='flicker'?'Boring (flicker)':'Cool (waterfall)'}`,"INFO"); });
+$("speed").addEventListener("change",e=>{
+  const fps=parseFloat(e.target.value); S.minInterval=fps<=0?0:1/fps;
+  logEvent(`display rate cap -> ${fps<=0?'full speed':fps+' fps'}`,"INFO");
+});
+$("auto").addEventListener("change",e=>{ S.autoColor=e.target.checked; });
+$("abs").addEventListener("change",e=>{ S.absolute=e.target.checked; geomKey=""; S.regionLo=null;
+  logEvent(`x-axis -> ${S.absolute?'absolute RF':'baseband'}`,"INFO"); });
+$("pause").addEventListener("click",e=>{
+  S.paused=!S.paused; e.target.textContent=S.paused?"Resume":"Pause";
+  e.target.classList.toggle("toggled",S.paused);
+});
+$("reset").addEventListener("click",()=>{ logEvent("view reset","INFO"); });
+$("diff").addEventListener("change",e=>S.diff=e.target.checked);
+$("peak").addEventListener("change",e=>S.peakMarker=e.target.checked);
+$("hold").addEventListener("change",e=>{ S.peakHold=e.target.checked; if(!S.peakHold)S.hold=[null,null]; });
+$("clearhold").addEventListener("click",()=>{ S.hold=[null,null]; logEvent("peak hold cleared","INFO"); });
+$("min").addEventListener("change",e=>S.showMin=e.target.checked);
+$("cross").addEventListener("change",e=>S.crosshair=e.target.checked);
+$("tune").addEventListener("click",()=>{
+  if(S.regionLo===null) return;
+  const sel=0.5*(S.regionLo+S.regionHi);
+  let nc = S.absolute ? sel*1e6 : S.center + sel*1e6;
+  nc=Math.max(300e6,Math.min(6e9,nc));
+  applyChange("radio","center",S.center,nc);
+  S.center=nc; $("center").value=(nc/1e6).toFixed(3); geomKey=""; S.regionLo=null;
+});
+$("png").addEventListener("click",()=>{
+  // stitch the three plots into one PNG
+  const w=Math.max(psdCv.width, panes[0].cv.width+panes[1].cv.width);
+  const h=panes[0].cv.height+psdCv.height+8;
+  const out=document.createElement("canvas"); out.width=w; out.height=h;
+  const c=out.getContext("2d"); c.fillStyle="#101418"; c.fillRect(0,0,w,h);
+  c.drawImage(panes[0].cv,0,0); c.drawImage(panes[1].cv,panes[0].cv.width,0);
+  c.drawImage(psdCv,0,panes[0].cv.height+8);
+  const a=document.createElement("a");
+  a.download="air_live_sim.png"; a.href=out.toDataURL("image/png"); a.click();
+  logEvent("PNG exported (simulated view)","INFO");
+});
+
+// ---- PSD pointer: crosshair + draggable measurement band -----------------
+let drag=null;
+function psdCoords(ev){
+  const r=psdCv.getBoundingClientRect(), g=psdGeom; if(!g) return null;
+  const px=(ev.clientX-r.left)*(psdCv.width/r.width);
+  const py=(ev.clientY-r.top)*(psdCv.height/r.height);
+  const f=g.f0+(g.f1-g.f0)*(px-g.L)/g.pw;
+  const p=g.yLo+(g.yHi-g.yLo)*(1-(py-g.T)/g.ph);
+  return {f,p,px,py};
+}
+psdCv.addEventListener("mousemove",ev=>{
+  const c=psdCoords(ev); if(!c) return;
+  S.cursor={x:c.f,y:c.p};
+  if(drag){
+    if(drag==='lo') S.regionLo=c.f;
+    else if(drag==='hi') S.regionHi=c.f;
+    else { const w=S.regionHi-S.regionLo; S.regionLo=c.f-drag.off; S.regionHi=S.regionLo+w; }
+    updateBand();
+  } else {
+    const g=psdGeom, xa=g.fx(S.regionLo), xb=g.fx(S.regionHi);
+    psdCv.style.cursor=(Math.abs(c.px-xa)<6*g.dpr||Math.abs(c.px-xb)<6*g.dpr)?"ew-resize":
+                       (c.px>xa&&c.px<xb?"grab":"crosshair");
+  }
+});
+psdCv.addEventListener("mousedown",ev=>{
+  const c=psdCoords(ev); if(!c||S.regionLo===null) return;
+  const g=psdGeom, xa=g.fx(S.regionLo), xb=g.fx(S.regionHi);
+  if(Math.abs(c.px-xa)<6*g.dpr) drag='lo';
+  else if(Math.abs(c.px-xb)<6*g.dpr) drag='hi';
+  else if(c.px>xa&&c.px<xb) drag={off:c.f-Math.min(S.regionLo,S.regionHi)};
+});
+window.addEventListener("mouseup",()=>{ if(drag){ // normalize
+  if(S.regionLo>S.regionHi){const t=S.regionLo;S.regionLo=S.regionHi;S.regionHi=t;} } drag=null; });
+psdCv.addEventListener("mouseleave",()=>{ S.cursor=null; });
+
+window.addEventListener("resize",()=>{ /* canvases re-measure each frame */ });
+
+// ---- boot ----------------------------------------------------------------
+logEvent("app starting (web simulation, no hardware)","INFO");
+logEvent("radio armed: center 1955.00 MHz, 15.360 MS/s, channels 0,1","INFO");
+setStatus("running locally (simulation)");
+</script>
+</body>
+</html>

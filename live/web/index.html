@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIR8201 Live Spectrogram + PSD</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- uPlot: fast canvas charting for the PSD plot. CDN; can be vendored. -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+</head>
+<body>
+
+<!-- ── Controls ──────────────────────────────────────────────────────────── -->
+<div id="controls">
+
+    <div class="ctrl-group" id="radio-ctrl">
+        <span class="group-label">Radio (AIR-T)</span>
+
+        <label>Center (MHz)
+            <input type="number" id="center-mhz" step="0.5" min="300" max="6000" value="1955">
+        </label>
+        <button id="center-btn">Apply</button>
+
+        <label>Span (MS/s)
+            <select id="rate-sel">
+                <option value="3.84">3.84</option>
+                <option value="7.68">7.68</option>
+                <option value="15.36" selected>15.36</option>
+                <option value="30.72">30.72</option>
+            </select>
+        </label>
+
+        <label>Gain (dB)
+            <input type="number" id="gain" step="0.5" min="-30" max="0" value="0">
+        </label>
+        <button id="gain-btn">Apply</button>
+
+        <label>FFT
+            <select id="nfft-sel">
+                <option value="256">256</option>
+                <option value="512">512</option>
+                <option value="1024" selected>1024</option>
+                <option value="2048">2048</option>
+                <option value="4096">4096</option>
+            </select>
+        </label>
+
+        <button id="tune-btn">Tune to band</button>
+    </div>
+
+    <div class="ctrl-group" id="disp-ctrl">
+        <span class="group-label">Display</span>
+
+        <button id="pause-btn">Pause</button>
+
+        <label>Mode
+            <select id="mode-sel">
+                <option value="replace" selected>Boring Mode 🥱</option>
+                <option value="scroll">Cool Mode 😎</option>
+            </select>
+        </label>
+
+        <label>Window (ms)
+            <select id="win-sel">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+            </select>
+        </label>
+
+        <label><input type="checkbox" id="auto-color" checked> Auto color</label>
+        <label><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
+
+        <button id="reset-btn">Reset view</button>
+        <button id="csv-btn">Save PSD CSV</button>
+        <button id="png-btn">Export PNG</button>
+    </div>
+
+    <div class="ctrl-group" id="psd-ctrl">
+        <span class="group-label">PSD tools</span>
+
+        <label><input type="checkbox" id="diff-chk">  RX1−RX2 diff</label>
+        <label><input type="checkbox" id="peak-chk" checked> Peak marker</label>
+        <label><input type="checkbox" id="hold-chk">  Peak hold</label>
+        <button id="clear-hold-btn">Clear hold</button>
+        <label><input type="checkbox" id="min-chk">   Min trace</label>
+        <label><input type="checkbox" id="cross-chk" checked> Crosshair</label>
+
+        <label>Y span (dB)
+            <select id="yspan-sel">
+                <option value="auto" selected>Auto</option>
+                <option value="10">10</option>
+                <option value="20">20</option>
+                <option value="40">40</option>
+                <option value="60">60</option>
+            </select>
+        </label>
+    </div>
+
+</div><!-- #controls -->
+
+<!-- ── Status / meta ─────────────────────────────────────────────────────── -->
+<div id="statusbar">
+    <span id="status-text">connecting…</span>
+    <span id="meta-text"></span>
+</div>
+
+<!-- ── Band power monitor ────────────────────────────────────────────────── -->
+<div id="band-monitor">Band monitor: --</div>
+
+<!-- ── Waterfalls ────────────────────────────────────────────────────────── -->
+<div id="waterfall-row">
+    <div class="wf-pane" id="wf-pane-0">
+        <div class="wf-title">Spectrogram Port 0 — RX1</div>
+        <div class="wf-wrap">
+            <canvas class="wf-canvas" id="wf0"></canvas>
+        </div>
+    </div>
+    <div class="wf-pane" id="wf-pane-1">
+        <div class="wf-title">Spectrogram Port 1 — RX2</div>
+        <div class="wf-wrap">
+            <canvas class="wf-canvas" id="wf1"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- ── PSD plot ───────────────────────────────────────────────────────────── -->
+<div id="psd-row">
+    <div id="psd-container">
+        <div id="psd-plot"></div>
+        <!-- band selection overlay rendered by app.js -->
+        <canvas id="band-canvas"></canvas>
+    </div>
+</div>
+
+<!-- ── Log ───────────────────────────────────────────────────────────────── -->
+<div id="log-row">
+    <pre id="log-pre"></pre>
+</div>
+
+<!-- ── Scripts ───────────────────────────────────────────────────────────── -->
+<script src="colormap.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
