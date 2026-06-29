@@ -27,8 +27,10 @@ Or use the convenience launcher:
 
 import argparse
 import asyncio
+import base64
 import json
 import os
+import secrets
 import struct
 import sys
 import threading
@@ -107,6 +109,96 @@ WEB_DIR = Path(__file__).parent / "web"
 
 # Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
 SPEC_BACKEND = os.environ.get("SPEC_BACKEND", "calibrated").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# HTTP Basic Auth (single shared credential, read from the environment)
+# ---------------------------------------------------------------------------
+#
+# Set RADIO_USER and RADIO_PASS in the environment to put the whole viewer
+# (static page, assets, and the /ws WebSocket) behind one shared login. If
+# either is unset, auth is DISABLED so --demo / local dev keeps working — a
+# loud warning is printed at startup in that case.
+
+_AUTH_USER  = os.environ.get("RADIO_USER") or ""
+_AUTH_PASS  = os.environ.get("RADIO_PASS") or ""
+AUTH_ENABLED = bool(_AUTH_USER and _AUTH_PASS)
+AUTH_REALM   = "striqt live viewer"
+
+
+def check_basic_auth(auth_header) -> bool:
+    """
+    Validate an HTTP `Authorization` header against RADIO_USER/RADIO_PASS using
+    constant-time comparison. Returns True when auth is disabled (no creds set)
+    so local/demo runs are unaffected.
+
+    `auth_header` may be a str (Starlette Request) or bytes (raw ASGI scope).
+    """
+    if not AUTH_ENABLED:
+        return True
+    if not auth_header:
+        return False
+    if isinstance(auth_header, bytes):
+        auth_header = auth_header.decode("latin-1")
+
+    scheme, _, param = auth_header.partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        user, _, pw = base64.b64decode(param).decode("utf-8").partition(":")
+    except Exception:
+        return False
+
+    # Compare BOTH fields every time (no short-circuit) to avoid timing leaks.
+    user_ok = secrets.compare_digest(user, _AUTH_USER)
+    pw_ok   = secrets.compare_digest(pw, _AUTH_PASS)
+    return user_ok and pw_ok
+
+
+class BasicAuthMiddleware:
+    """
+    Pure-ASGI middleware that gates EVERY http and websocket request behind a
+    single shared Basic-Auth credential. Mounted static files and the /ws
+    endpoint are all covered because it wraps the entire app.
+
+    On failure:
+      - http      → 401 + `WWW-Authenticate: Basic` so the browser shows the
+                    standard username/password popup.
+      - websocket → the handshake is rejected (browsers replay the page's
+                    cached Basic credentials on the WS upgrade, so a viewer that
+                    authenticated for the page connects fine; anyone else is
+                    refused before `accept()`).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if not AUTH_ENABLED or scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        if check_basic_auth(headers.get(b"authorization")):
+            await self.app(scope, receive, send)
+            return
+
+        if scope["type"] == "websocket":
+            # Reject the upgrade before accept(); no credentials means no frames.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+
+        body = b"401 Unauthorized"
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"www-authenticate", f'Basic realm="{AUTH_REALM}"'.encode("latin-1")),
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("latin-1")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +928,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="striqt live viewer", lifespan=lifespan)
 
+# Gate the whole app (static page, assets, and /ws) behind shared Basic Auth.
+# A no-op at request time when RADIO_USER/RADIO_PASS are unset.
+app.add_middleware(BasicAuthMiddleware)
+
 
 async def _broadcaster():
     """
@@ -1006,6 +1102,21 @@ def main():
     q_note  = " + uint8 quantization" if _quantize else ""
     print(f"\nstriqt web viewer — {mode}")
     print(f"  backend={SPEC_BACKEND}, fps={BROADCAST_FPS:.0f}{q_note}")
+
+    # Report auth status loudly so an unintentionally-open public server is obvious.
+    if AUTH_ENABLED:
+        print(f"  auth:     Basic Auth ENABLED (user '{_AUTH_USER}', from RADIO_USER/RADIO_PASS)")
+    elif os.environ.get("RADIO_USER") or os.environ.get("RADIO_PASS"):
+        print(
+            "  auth:     *** WARNING: only one of RADIO_USER / RADIO_PASS set — "
+            "auth DISABLED. Set BOTH to enable the login. ***"
+        )
+    else:
+        print(
+            "  auth:     *** WARNING: auth DISABLED — server is OPEN to anyone. "
+            "Set RADIO_USER and RADIO_PASS to require a login. ***"
+        )
+
     print(f"  listening on http://{args.host}:{args.port}")
     if args.host in ("0.0.0.0", "::"):
         print(f"  local:    http://localhost:{args.port}")
