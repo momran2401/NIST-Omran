@@ -2,24 +2,55 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="color-scheme" content="dark">
     <title>AIR8201 Live Spectrogram + PSD</title>
     <link rel="stylesheet" href="style.css">
     <!-- uPlot: fast canvas charting for the PSD plot. CDN; can be vendored. -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
 </head>
-<body>
+<body class="mode-pro">
+
+<!-- ── App header ────────────────────────────────────────────────────────── -->
+<header id="app-header">
+    <div class="brand">
+        <span class="brand-mark"></span>
+        <div class="brand-text">
+            <h1>AIR8201 Live Viewer</h1>
+            <p>Spectrogram &amp; PSD · dual receiver</p>
+        </div>
+    </div>
+
+    <div class="mode-switch" role="group" aria-label="Interface mode">
+        <button type="button" class="mode-opt" data-mode="pro">PRO</button>
+        <button type="button" class="mode-opt" data-mode="noob">NOOB</button>
+    </div>
+
+    <div id="statusbar">
+        <span class="status-pill">
+            <span class="status-dot"></span>
+            <span id="status-text">connecting…</span>
+        </span>
+        <span id="meta-text"></span>
+    </div>
+
+    <button id="ctrl-toggle" class="pro-only" type="button" aria-expanded="true" aria-controls="controls">
+        Controls
+    </button>
+</header>
 
 <!-- ── Controls ──────────────────────────────────────────────────────────── -->
 <div id="controls">
 
-    <div class="ctrl-group" id="radio-ctrl">
+    <div class="ctrl-group pro-only" id="radio-ctrl">
         <span class="group-label">Radio (AIR-T)</span>
 
-        <label>Center (MHz)
-            <input type="number" id="center-mhz" step="0.5" min="300" max="6000" value="1955">
-        </label>
-        <button id="center-btn">Apply</button>
+        <div class="field-row">
+            <label>Center (MHz)
+                <input type="number" id="center-mhz" step="0.5" min="300" max="6000" value="1955">
+            </label>
+            <button id="center-btn">Apply</button>
+        </div>
 
         <label>Span (MS/s)
             <select id="rate-sel">
@@ -30,10 +61,12 @@
             </select>
         </label>
 
-        <label>Gain (dB)
-            <input type="number" id="gain" step="0.5" min="-30" max="0" value="0">
-        </label>
-        <button id="gain-btn">Apply</button>
+        <div class="field-row">
+            <label>Gain (dB)
+                <input type="number" id="gain" step="0.5" min="-30" max="0" value="0">
+            </label>
+            <button id="gain-btn">Apply</button>
+        </div>
 
         <label>FFT
             <select id="nfft-sel">
@@ -60,7 +93,7 @@
             </select>
         </label>
 
-        <label>Window (ms)
+        <label class="pro-only">Window (ms)
             <select id="win-sel">
                 <option value="10">10</option>
                 <option value="20" selected>20</option>
@@ -72,23 +105,23 @@
             </select>
         </label>
 
-        <label><input type="checkbox" id="auto-color" checked> Auto color</label>
-        <label><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
+        <label class="check pro-only"><input type="checkbox" id="auto-color" checked> Auto color</label>
+        <label class="check pro-only"><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
 
-        <button id="reset-btn">Reset view</button>
-        <button id="csv-btn">Save PSD CSV</button>
-        <button id="png-btn">Export PNG</button>
+        <button id="reset-btn" class="pro-only">Reset view</button>
+        <button id="csv-btn" class="pro-only">Save PSD CSV</button>
+        <button id="png-btn" class="pro-only">Export PNG</button>
     </div>
 
-    <div class="ctrl-group" id="psd-ctrl">
+    <div class="ctrl-group pro-only" id="psd-ctrl">
         <span class="group-label">PSD tools</span>
 
-        <label><input type="checkbox" id="diff-chk">  RX1−RX2 diff</label>
-        <label><input type="checkbox" id="peak-chk" checked> Peak marker</label>
-        <label><input type="checkbox" id="hold-chk">  Peak hold</label>
+        <label class="check"><input type="checkbox" id="diff-chk">  RX1−RX2 diff</label>
+        <label class="check"><input type="checkbox" id="peak-chk" checked> Peak marker</label>
+        <label class="check"><input type="checkbox" id="hold-chk">  Peak hold</label>
         <button id="clear-hold-btn">Clear hold</button>
-        <label><input type="checkbox" id="min-chk">   Min trace</label>
-        <label><input type="checkbox" id="cross-chk" checked> Crosshair</label>
+        <label class="check"><input type="checkbox" id="min-chk">   Min trace</label>
+        <label class="check"><input type="checkbox" id="cross-chk" checked> Crosshair</label>
 
         <label>Y span (dB)
             <select id="yspan-sel">
@@ -103,49 +136,247 @@
 
 </div><!-- #controls -->
 
-<!-- ── Status / meta ─────────────────────────────────────────────────────── -->
-<div id="statusbar">
-    <span id="status-text">connecting…</span>
-    <span id="meta-text"></span>
-</div>
+<!-- ── Main dashboard ────────────────────────────────────────────────────── -->
+<main id="dashboard">
 
-<!-- ── Band power monitor ────────────────────────────────────────────────── -->
-<div id="band-monitor">Band monitor: --</div>
-
-<!-- ── Waterfalls ────────────────────────────────────────────────────────── -->
-<div id="waterfall-row">
-    <div class="wf-pane" id="wf-pane-0">
-        <div class="wf-title">Spectrogram Port 0 — RX1</div>
-        <div class="wf-wrap">
-            <canvas class="wf-canvas" id="wf0"></canvas>
+    <!-- Noob frequency tuner (NOOB mode only) -->
+    <section class="panel noob-only" id="noob-tuner">
+        <div class="panel-head">
+            <h2>Tune to a station</h2>
+            <span class="panel-hint">pick a signal — we set the frequency for you</span>
         </div>
-    </div>
-    <div class="wf-pane" id="wf-pane-1">
-        <div class="wf-title">Spectrogram Port 1 — RX2</div>
-        <div class="wf-wrap">
-            <canvas class="wf-canvas" id="wf1"></canvas>
+        <div id="noob-freq-groups"></div>
+    </section>
+
+    <!-- Band power monitor -->
+    <section class="panel pro-only" id="band-panel">
+        <div class="panel-head">
+            <h2>Band monitor</h2>
+            <span class="panel-hint">drag on the PSD plot to select a band</span>
         </div>
-    </div>
-</div>
+        <div id="band-monitor">Band monitor: --</div>
+    </section>
 
-<!-- ── PSD plot ───────────────────────────────────────────────────────────── -->
-<div id="psd-row">
-    <div id="psd-container">
-        <div id="psd-plot"></div>
-        <!-- band selection overlay rendered by app.js -->
-        <canvas id="band-canvas"></canvas>
-    </div>
-</div>
+    <!-- Waterfalls -->
+    <section id="waterfall-row">
+        <div class="wf-pane" id="wf-pane-0">
+            <div class="wf-title"><span class="dot dot-rx1"></span>Spectrogram Port 0 — RX1</div>
+            <div class="wf-wrap">
+                <canvas class="wf-canvas" id="wf0"></canvas>
+                <div class="wf-freq-axis"></div>
+            </div>
+        </div>
+        <div class="wf-pane" id="wf-pane-1">
+            <div class="wf-title"><span class="dot dot-rx2"></span>Spectrogram Port 1 — RX2</div>
+            <div class="wf-wrap">
+                <canvas class="wf-canvas" id="wf1"></canvas>
+                <div class="wf-freq-axis"></div>
+            </div>
+        </div>
+    </section>
 
-<!-- ── Log ───────────────────────────────────────────────────────────────── -->
-<div id="log-row">
-    <pre id="log-pre"></pre>
-</div>
+    <!-- PSD plot -->
+    <section class="panel" id="psd-row">
+        <div class="panel-head">
+            <h2>Power spectral density</h2>
+            <div class="legend-key">
+                <span class="key"><i class="swatch swatch-mean"></i>Mean</span>
+                <span class="key"><i class="swatch swatch-max"></i>Max</span>
+            </div>
+        </div>
+        <div id="psd-container">
+            <div id="psd-plot"></div>
+            <!-- band selection overlay rendered by app.js -->
+            <canvas id="band-canvas"></canvas>
+        </div>
+    </section>
+
+    <!-- Log -->
+    <section class="panel" id="log-row">
+        <div class="panel-head">
+            <h2>Log</h2>
+        </div>
+        <pre id="log-pre"></pre>
+    </section>
+
+</main>
 
 <!-- ── Scripts ───────────────────────────────────────────────────────────── -->
 <script src="colormap.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <script src="app.js"></script>
+
+<!-- Controls collapse toggle (layout only — does not touch data/functionality) -->
+<script>
+(function () {
+    var toggle   = document.getElementById("ctrl-toggle");
+    var controls = document.getElementById("controls");
+    var mq       = window.matchMedia("(max-width: 760px)");
+
+    function setOpen(open) {
+        controls.classList.toggle("collapsed", !open);
+        toggle.setAttribute("aria-expanded", String(open));
+    }
+    // Collapsed by default on small screens, open on desktop.
+    function applyDefault() { setOpen(!mq.matches); }
+    applyDefault();
+    mq.addEventListener("change", applyDefault);
+
+    toggle.addEventListener("click", function () {
+        setOpen(controls.classList.contains("collapsed"));
+    });
+})();
+</script>
+
+<!-- PRO / NOOB mode switch + NOOB station tuner (front-end only — sends the
+     same { center } control the "Apply" button uses; no radio code changes) -->
+<script>
+(function () {
+    var STORAGE_KEY = "viewerMode";
+    var body       = document.body;
+    var modeBtns   = document.querySelectorAll(".mode-opt");
+    var controls   = document.getElementById("controls");
+
+    function applyMode(mode) {
+        var noob = mode === "noob";
+        body.classList.toggle("mode-noob", noob);
+        body.classList.toggle("mode-pro", !noob);
+        modeBtns.forEach(function (b) {
+            var on = b.dataset.mode === mode;
+            b.classList.toggle("active", on);
+            b.setAttribute("aria-pressed", String(on));
+        });
+        // NOOB has only a couple of controls — never keep them collapsed.
+        if (noob && controls) controls.classList.remove("collapsed");
+        try { localStorage.setItem(STORAGE_KEY, mode); } catch (e) {}
+    }
+
+    modeBtns.forEach(function (b) {
+        b.addEventListener("click", function () { applyMode(b.dataset.mode); });
+    });
+
+    var saved = "pro";
+    try { saved = localStorage.getItem(STORAGE_KEY) || "pro"; } catch (e) {}
+    applyMode(saved);
+
+    // ── Station presets ──────────────────────────────────────────────────
+    // Each entry: human label + a single center frequency (MHz) to tune to.
+    // For a band/range we use a representative center. Anything outside the
+    // radio's 300 MHz – 6 GHz tuning range is shown but disabled.
+    var FREQ_GROUPS = [
+        { name: "Broadcast & VHF", items: [
+            { label: "FM broadcast radio",      mhz: 98 },
+            { label: "Aircraft AM voice",       mhz: 127 },
+            { label: "2 m amateur",             mhz: 146 },
+            { label: "Marine VHF / AIS",        mhz: 162 },
+            { label: "NOAA weather radio",      mhz: 162.475 },
+            { label: "VHF-Hi TV (ch 7–13)",     mhz: 195 },
+            { label: "UHF TV broadcast",        mhz: 539 },
+            { label: "FRS / GMRS walkie-talkie", mhz: 464.5 },
+        ]},
+        { name: "Wi-Fi · Bluetooth · ISM", items: [
+            { label: "433 MHz ISM (key fobs)",  mhz: 433.92 },
+            { label: "915 MHz ISM (LoRa/Zigbee)", mhz: 915 },
+            { label: "2.4 GHz Wi-Fi / Bluetooth", mhz: 2442 },
+            { label: "5 GHz Wi-Fi (U-NII)",     mhz: 5500 },
+            { label: "5.8 GHz ISM",             mhz: 5800 },
+            { label: "DECT cordless phones",    mhz: 1925 },
+        ]},
+        { name: "Cellular — low band", items: [
+            { label: "B71 600 MHz (T-Mobile)",  mhz: 634.5 },
+            { label: "B12 700 MHz (AT&T)",      mhz: 737.5 },
+            { label: "B13 700 MHz (Verizon)",   mhz: 751 },
+            { label: "B14 FirstNet (AT&T)",     mhz: 763 },
+            { label: "B5 850 MHz Cellular",     mhz: 881.5 },
+        ]},
+        { name: "Cellular — mid band", items: [
+            { label: "B2 / B25 1900 PCS",       mhz: 1962.5 },
+            { label: "B4 / B66 AWS",            mhz: 2155 },
+            { label: "B30 WCS 2300 (AT&T)",     mhz: 2355 },
+            { label: "B41 / n41 2.5 GHz (T-Mobile 5G)", mhz: 2593 },
+            { label: "B7 2600 MHz",             mhz: 2655 },
+        ]},
+        { name: "5G C-band & shared", items: [
+            { label: "n48 / CBRS",              mhz: 3625 },
+            { label: "US C-band (n77)",         mhz: 3840 },
+            { label: "3.45 GHz (n77)",          mhz: 3500 },
+            { label: "n78 (global)",            mhz: 3550 },
+        ]},
+        { name: "GNSS · Aviation · Satellite", items: [
+            { label: "GPS L5",                  mhz: 1176.45 },
+            { label: "GPS L2",                  mhz: 1227.60 },
+            { label: "GPS L1 / Galileo E1",     mhz: 1575.42 },
+            { label: "GLONASS L1",              mhz: 1602 },
+            { label: "ADS-B aircraft (1090ES)", mhz: 1090 },
+            { label: "UAT aircraft (978)",      mhz: 978 },
+            { label: "Iridium satellite",       mhz: 1621.25 },
+            { label: "Inmarsat L-band sat",     mhz: 1542 },
+        ]},
+        { name: "Other recognizable", items: [
+            { label: "23 cm amateur",           mhz: 1270 },
+            { label: "700/800 public safety",   mhz: 851 },
+            { label: "Pagers (POCSAG)",         mhz: 930.5 },
+        ]},
+    ];
+
+    function fmtMHz(m) {
+        return (m % 1 === 0) ? m.toFixed(0)
+                             : m.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+    }
+
+    var host  = document.getElementById("noob-freq-groups");
+    var chips = [];
+
+    FREQ_GROUPS.forEach(function (g) {
+        var section = document.createElement("div");
+        section.className = "freq-group";
+
+        var h = document.createElement("div");
+        h.className   = "freq-group-label";
+        h.textContent = g.name;
+        section.appendChild(h);
+
+        var grid = document.createElement("div");
+        grid.className = "freq-grid";
+
+        g.items.forEach(function (it) {
+            var tunable = it.mhz >= 300 && it.mhz <= 6000;
+            var chip = document.createElement("button");
+            chip.type = "button";
+            chip.className = "freq-chip" + (tunable ? "" : " is-disabled");
+            chip.innerHTML =
+                '<span class="fc-name"></span>' +
+                '<span class="fc-mhz"></span>';
+            chip.querySelector(".fc-name").textContent = it.label;
+            chip.querySelector(".fc-mhz").textContent  =
+                tunable ? fmtMHz(it.mhz) + " MHz" : "below radio range";
+
+            if (!tunable) {
+                chip.disabled = true;
+                chip.title = "Outside the radio's 300 MHz – 6 GHz tuning range";
+            } else {
+                chip.addEventListener("click", function () {
+                    var input = document.getElementById("center-mhz");
+                    if (input) input.value = it.mhz.toFixed(3);
+                    if (typeof sendControl === "function") {
+                        sendControl({ center: it.mhz * 1e6 });
+                    }
+                    if (typeof logMsg === "function") {
+                        logMsg("Tuned to " + it.label + " — " + fmtMHz(it.mhz) + " MHz");
+                    }
+                    chips.forEach(function (c) { c.classList.remove("selected"); });
+                    chip.classList.add("selected");
+                });
+            }
+            grid.appendChild(chip);
+            chips.push(chip);
+        });
+
+        section.appendChild(grid);
+        host.appendChild(section);
+    });
+})();
+</script>
 
 </body>
 </html>
