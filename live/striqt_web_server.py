@@ -28,6 +28,8 @@ Or use the convenience launcher:
 import argparse
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -155,6 +157,80 @@ def check_basic_auth(auth_header) -> bool:
     return user_ok and pw_ok
 
 
+# ---------------------------------------------------------------------------
+# Signed session cookie
+# ---------------------------------------------------------------------------
+#
+# Safari and every iOS browser refuse to replay HTTP Basic credentials on the
+# WebSocket upgrade handshake, so a Basic-Auth-only gate locks those clients out
+# of /ws even after they log in for the page. To fix this, once an HTTP request
+# authenticates we hand the browser a signed "radio_auth" cookie; the cookie is
+# carried automatically on the subsequent WS handshake and accepted there.
+#
+# The signing secret is derived from the existing RADIO_USER/RADIO_PASS — no new
+# env var — so rotating the password invalidates outstanding tokens.
+
+_SESSION_SECRET = hashlib.sha256(
+    (_AUTH_USER + ":" + _AUTH_PASS).encode()
+).digest()
+SESSION_TTL = 86400
+
+
+def make_session_token(ttl_seconds: int = SESSION_TTL) -> str:
+    """
+    Build a signed session token "<exp>.<hex_hmac>" where exp is an int unix
+    expiry and hex_hmac = HMAC-SHA256(secret, str(exp)). Unused when auth is
+    disabled.
+    """
+    exp = int(time.time()) + ttl_seconds
+    mac = hmac.new(_SESSION_SECRET, str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{mac}"
+
+
+def verify_session_token(token) -> bool:
+    """
+    Validate a "<exp>.<hex_hmac>" session token: recompute the HMAC with a
+    constant-time comparison and confirm the expiry is still in the future.
+    Returns False on any malformed input. A no-op (unused) when auth is disabled.
+    """
+    if not token:
+        return False
+    if isinstance(token, bytes):
+        token = token.decode("latin-1")
+
+    exp_str, _, mac = token.partition(".")
+    if not mac:
+        return False
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False
+
+    expected = hmac.new(
+        _SESSION_SECRET, exp_str.encode(), hashlib.sha256
+    ).hexdigest()
+    if not secrets.compare_digest(mac, expected):
+        return False
+    return exp > int(time.time())
+
+
+def _session_cookie_from_scope(scope) -> bool:
+    """
+    Parse the request's Cookie header from a raw ASGI scope and return True when
+    a "radio_auth" cookie is present and passes verify_session_token.
+    """
+    headers = dict(scope.get("headers") or [])
+    raw_cookie = headers.get(b"cookie")
+    if not raw_cookie:
+        return False
+    cookie_str = raw_cookie.decode("latin-1")
+    for part in cookie_str.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == "radio_auth":
+            return verify_session_token(value)
+    return False
+
+
 class BasicAuthMiddleware:
     """
     Pure-ASGI middleware that gates EVERY http and websocket request behind a
@@ -173,14 +249,42 @@ class BasicAuthMiddleware:
     def __init__(self, app):
         self.app = app
 
+    @staticmethod
+    def _set_cookie_send(send):
+        """
+        Wrap `send` to append a Set-Cookie header carrying a fresh session token
+        on the HTTP response start. Only the success path uses this, so the
+        cookie is never attached to a 401.
+        """
+        async def wrapped(message):
+            if message["type"] == "http.response.start":
+                cookie = (
+                    f"radio_auth={make_session_token()}; Path=/; HttpOnly; "
+                    f"Secure; SameSite=Lax; Max-Age={SESSION_TTL}"
+                )
+                headers = list(message.get("headers") or [])
+                headers.append((b"set-cookie", cookie.encode("latin-1")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        return wrapped
+
     async def __call__(self, scope, receive, send):
         if not AUTH_ENABLED or scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
         headers = dict(scope.get("headers") or [])
-        if check_basic_auth(headers.get(b"authorization")):
-            await self.app(scope, receive, send)
+        # Authenticated via Basic Auth header OR a valid signed session cookie.
+        # The cookie path lets browsers that drop Basic creds on the WS upgrade
+        # (Safari / all iOS browsers) still connect to /ws after logging in.
+        if check_basic_auth(headers.get(b"authorization")) or _session_cookie_from_scope(scope):
+            if scope["type"] == "http":
+                # Refresh the session cookie so the browser carries it on the
+                # WS handshake. Never set it on websocket scopes.
+                await self.app(scope, receive, self._set_cookie_send(send))
+            else:
+                await self.app(scope, receive, send)
             return
 
         if scope["type"] == "websocket":
