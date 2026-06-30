@@ -555,3 +555,25 @@ body.mode-noob .pro-only  { display: none !important; }
     .mode-opt { padding: 7px 14px; }
     .freq-grid { grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); }
 }
+
+/* ── Footer ───────────────────────────────────────────────────────────────── */
+#app-footer {
+    text-align: center;
+    padding: 18px 14px calc(22px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+#app-footer .footer-credit  { color: var(--text-faint); }
+#app-footer .footer-credit strong { color: var(--text-dim); font-weight: 650; }
+#app-footer .footer-restrict {
+    color: var(--yellow);
+    opacity: 0.85;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+}
