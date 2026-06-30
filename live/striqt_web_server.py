@@ -201,6 +201,37 @@ class BasicAuthMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class NoCacheMiddleware:
+    """
+    Pure-ASGI middleware that stamps no-store cache headers on every HTTP
+    response so browsers always refetch the page and assets. WebSocket and
+    other scope types pass straight through untouched.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, v)
+                    for (k, v) in message.get("headers") or []
+                    if k.lower() not in (b"cache-control", b"expires", b"pragma")
+                ]
+                headers.append((b"cache-control", b"no-store, max-age=0"))
+                headers.append((b"pragma", b"no-cache"))
+                headers.append((b"expires", b"0"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 # ---------------------------------------------------------------------------
 # Shared radio config (thread-safe)
 # ---------------------------------------------------------------------------
@@ -931,6 +962,7 @@ app = FastAPI(title="striqt live viewer", lifespan=lifespan)
 # Gate the whole app (static page, assets, and /ws) behind shared Basic Auth.
 # A no-op at request time when RADIO_USER/RADIO_PASS are unset.
 app.add_middleware(BasicAuthMiddleware)
+app.add_middleware(NoCacheMiddleware)
 
 
 async def _broadcaster():
