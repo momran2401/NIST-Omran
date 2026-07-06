@@ -42,45 +42,6 @@
 <!-- ── Controls ──────────────────────────────────────────────────────────── -->
 <div id="controls">
 
-    <div class="ctrl-group pro-only" id="radio-ctrl">
-        <span class="group-label">Radio (AIR-T)</span>
-
-        <div class="field-row">
-            <label>Center (MHz)
-                <input type="number" id="center-mhz" step="0.5" min="300" max="6000" value="1955">
-            </label>
-            <button id="center-btn">Apply</button>
-        </div>
-
-        <label>Span (MS/s)
-            <select id="rate-sel">
-                <option value="3.84">3.84</option>
-                <option value="7.68">7.68</option>
-                <option value="15.36" selected>15.36</option>
-                <option value="30.72">30.72</option>
-            </select>
-        </label>
-
-        <div class="field-row">
-            <label>Gain (dB)
-                <input type="number" id="gain" step="0.5" min="-60" max="10" value="0" title="AIR-T RX gain">
-            </label>
-            <button id="gain-btn">Apply</button>
-        </div>
-
-        <label>FFT
-            <select id="nfft-sel">
-                <option value="256">256</option>
-                <option value="512">512</option>
-                <option value="1024" selected>1024</option>
-                <option value="2048">2048</option>
-                <option value="4096">4096</option>
-            </select>
-        </label>
-
-        <button id="tune-btn">Tune to band</button>
-    </div>
-
     <div class="ctrl-group" id="disp-ctrl">
         <span class="group-label">Display</span>
 
@@ -102,16 +63,19 @@
             </select>
         </label>
 
-        <label class="pro-only">Window (ms)
-            <select id="win-sel">
+        <label title="Displayed time span — drives the number of waterfall rows">Duration (ms)
+            <select id="dur-sel">
+                <option value="2">2</option>
+                <option value="5">5</option>
                 <option value="10">10</option>
                 <option value="20" selected>20</option>
                 <option value="50">50</option>
                 <option value="100">100</option>
-                <option value="200">200</option>
-                <option value="500">500</option>
-                <option value="1000">1000</option>
+                <option value="custom" class="pro-only">custom…</option>
             </select>
+        </label>
+        <label class="pro-only" id="dur-custom-label" style="display:none">Custom (ms)
+            <input type="number" id="dur-custom" min="1" step="1" value="20">
         </label>
 
         <label class="pro-only" title="Cap the browser render rate (drops excess frames)">Max fps
@@ -167,11 +131,40 @@
     <div id="settings-editor">
         <div class="settings-col">
             <h3>Capture</h3>
+            <!-- FFT size is a spectrogram control, not a SoapyCapture field, so it
+                 lives here as a static control (outside the schema-rendered form,
+                 which is cleared on every reload). Sends {nfft} — snapped +
+                 validated server-side. Former home was the deleted Radio bar. -->
+            <div class="settings-grid settings-static">
+                <label>FFT size
+                    <select id="nfft-sel">
+                        <option value="256">256</option>
+                        <option value="512">512</option>
+                        <option value="1024" selected>1024</option>
+                        <option value="2048">2048</option>
+                        <option value="4096">4096</option>
+                    </select>
+                </label>
+            </div>
             <div id="capture-settings-form" class="settings-grid"></div>
         </div>
         <div class="settings-col">
             <h3>Source <span class="reconnect-badge">requires reconnect — not applied live</span></h3>
             <div id="source-settings-form" class="settings-grid"></div>
+        </div>
+        <!-- Analysis (P2a-6, per-analysis panels P2b-6): DAN-mode only (the
+             whole #settings-panel is pro-only). The fields are rendered by
+             app.js for the analysis currently selected in the Analysis
+             dropdown (spectrogram / PSD / SSB), matching the intent that the
+             config targets the shown analysis. Free-text inputs by design —
+             the freedom model on the server snaps knowable constraints
+             (reported as "invalid X → using Y") and scratch-validates the rest
+             with striqt before the live stream ever sees a new value. Values
+             seed from /config, so Apply re-sends only what you actually edit. -->
+        <div class="settings-col" id="analysis-col">
+            <h3>Analysis <span class="analysis-badge" id="analysis-badge"></span></h3>
+            <div id="analysis-form" class="settings-grid settings-static"></div>
+            <button id="analysis-apply" type="button">Apply analysis</button>
         </div>
     </div>
 </section>

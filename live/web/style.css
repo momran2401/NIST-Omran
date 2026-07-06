@@ -167,14 +167,33 @@ body.analysis-psd #waterfall-row {
     display: none;
 }
 
+/* PSD backend (P2b-4): the static Mean/Max swatch key is wrong once the trace
+   set follows time_statistic — the uPlot legend lists (and toggles) the real
+   set, so hide the fixed pair. */
+body.analysis-psd #psd-row .legend-key {
+    display: none;
+}
+
 #settings-panel {
     margin: var(--gap) 14px 0;
 }
 
 #settings-editor {
     display: grid;
-    grid-template-columns: repeat(2, minmax(280px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: var(--gap);
+}
+
+#analysis-col button {
+    margin-top: 8px;
+}
+
+.analysis-badge {
+    display: inline-block;
+    margin-left: 6px;
+    color: var(--text-faint);
+    font-size: 10px;
+    font-weight: 600;
 }
 
 .settings-col h3 {

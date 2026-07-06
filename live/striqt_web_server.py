@@ -38,6 +38,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from fractions import Fraction
@@ -138,7 +139,13 @@ DATA_STALE_SEC      = 1.0       # get_latest() returns None if the ring is older
 
 BROADCAST_FPS       = 15        # default max frames/sec to browsers
 SCROLL_ROWS         = 12        # rows per frame in Cool (scroll/waterfall) mode
-MAX_LIVE_ROWS       = 300       # safety cap on requested rows
+# Rows are bounded by what the IQ ring can actually supply (see max_live_rows()),
+# not a flat cap. The old MAX_LIVE_ROWS=300 pinned every long duration to 300 rows
+# and made the Duration control inert past ~10-20 ms (P1-5). MAX_ROWS_ABS is an
+# absolute ceiling protecting browser render + ring depth; RING_ROW_FILL leaves
+# headroom so the Computer's avail>=need gate is reached promptly.
+MAX_ROWS_ABS        = 4096      # absolute safety ceiling on requested rows
+RING_ROW_FILL       = 0.9       # fraction of MAX_TAIL usable for one frame's need
 
 # Allowed sample rates (LTE/5G-NR multiples of 1.92 MHz) and FFT sizes. Incoming
 # control values are snapped to the nearest of these so an off-list value can't
@@ -153,17 +160,43 @@ def _snap(value, choices):
 
 WEB_DIR = Path(__file__).parent / "web"
 
-# Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
+# Backend: "calibrated" (striqt PSD/ENBW dB spectrogram), "quicklook" (simple
+# FFT dB), "psd" (striqt power_spectral_density statistic traces, P2b-3), or
+# "ssb" (striqt 5G SSB spectrogram).
 SPEC_BACKEND = os.environ.get("SPEC_BACKEND", "calibrated").strip().lower()
-BACKENDS = {"calibrated", "quicklook", "ssb"}
+BACKENDS = {"calibrated", "quicklook", "ssb", "psd"}
 if SPEC_BACKEND not in BACKENDS:
     SPEC_BACKEND = "calibrated"
+
+# Backends whose STFT runs on the 28-multiple aligned_nfft grid.
+CALIBRATED_GRID_BACKENDS = frozenset({"calibrated", "ssb", "psd"})
 
 AVG_BIN_GROUPS = 12
 SSB_SUBCARRIER_SPACING = 30e3
 SSB_SAMPLE_RATE = 7.68e6
 SSB_DISCOVERY_PERIOD = 20e-3
 SSB_LO_BANDSTOP = 120e3
+SSB_WINDOW = "blackmanharris"
+# Ceiling for SSB-grid capture retunes (P2b-5): the top of the radio's LTE-rate
+# family. The grid rule (2·fs/scs a 28-multiple) admits no rate above this that
+# we would trust the AIR8201B to arm.
+SSB_MAX_RATE = 30.72e6
+
+# Default striqt Spectrogram recipe — the exact values calibrated_spectrogram
+# hardcoded before P2a-1. These seed the editable analysis params in RadioConfig,
+# so behaviour is unchanged until the user edits them from the Analysis panel.
+# integration_bandwidth "auto" reproduces the old frequency_resolution ×
+# averaging_factor(nfft) coupling (the only value that tracks nfft changes).
+DEFAULT_WINDOW             = ("kaiser", 11.88)
+DEFAULT_FRACTIONAL_OVERLAP = Fraction(13, 28)
+DEFAULT_WINDOW_FILL        = Fraction(15, 28)
+DEFAULT_INTEGRATION_BW     = "auto"
+DEFAULT_LO_BANDSTOP        = SSB_LO_BANDSTOP
+DEFAULT_TRIM_STOPBAND      = False
+
+# Default PSD time_statistic (P2b-3) — reproduces the mean+max trace pair the
+# client has always drawn, so behaviour is unchanged until the user edits it.
+DEFAULT_PSD_TIME_STATISTIC = ("mean", "max")
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +433,358 @@ class NoCacheMiddleware:
 
 
 # ---------------------------------------------------------------------------
+# Freedom-model input parsing (P2a-2)
+# ---------------------------------------------------------------------------
+#
+# DAN mode has no input guardrail — the user can type anything — so these
+# parsers only normalize *structure* (they never judge legality). Legality is
+# decided by tier 1 (knowable rules → snap and tell) and tier 2 (striqt itself,
+# via scratch_validate_analysis) in SharedConfig._validate_analysis.
+
+# Freedom-model analysis targets (P2b-1). Each target names one striqt analysis
+# whose parameter block is editable from the DAN-mode Analysis panel; the same
+# three tiers (snap & tell / scratch-validate / compute backstop) govern all of
+# them. A control message routes with {"analysis": {"target": <name>, ...}};
+# no target means "spectrogram" (the P2a wire format, unchanged).
+#   fields:  message field name -> RadioConfig attribute
+#   virtual: message fields validated here that map onto a non-analysis cfg key
+#            (frequency_resolution is the second view of nfft)
+#   order:   tier-2 one-at-a-time application order (RadioConfig keys)
+ANALYSIS_TARGETS = {
+    "spectrogram": {
+        "fields": {
+            "window":                "window",
+            "fractional_overlap":    "fractional_overlap",
+            "window_fill":           "window_fill",
+            "integration_bandwidth": "integration_bandwidth",
+            "lo_bandstop":           "lo_bandstop",
+            "trim_stopband":         "trim_stopband",
+            "time_aperture":         "time_aperture",
+        },
+        "virtual": ("frequency_resolution",),
+        # time_aperture goes last: its legality depends on the overlap/nfft this
+        # same message may be changing (the hop grid).
+        "order": ("nfft", "window", "fractional_overlap", "window_fill",
+                  "integration_bandwidth", "lo_bandstop", "trim_stopband",
+                  "time_aperture"),
+        # Cleared on the tier-2 working copy while earlier fields probe, when a
+        # replacement value is accepted: time_aperture rides the hop grid that
+        # nfft/overlap define, so probing those with the STALE aperture attached
+        # would falsely reject them; the fresh aperture re-probes at its own turn.
+        "probe_reset": ("time_aperture",),
+    },
+    # striqt power_spectral_density (P2b-3): the Welch-method statistic traces.
+    # Own parameter block (psd_* cfg keys) so tuning the PSD view never
+    # disturbs the spectrogram recipe, per-analysis-panel intent.
+    "psd": {
+        "fields": {
+            "window":                "psd_window",
+            "fractional_overlap":    "psd_fractional_overlap",
+            "window_fill":           "psd_window_fill",
+            "integration_bandwidth": "psd_integration_bandwidth",
+            "lo_bandstop":           "psd_lo_bandstop",
+            "trim_stopband":         "psd_trim_stopband",
+            "time_statistic":        "psd_time_statistic",
+        },
+        "virtual": ("frequency_resolution",),
+        "order": ("nfft", "psd_window", "psd_fractional_overlap",
+                  "psd_window_fill", "psd_integration_bandwidth",
+                  "psd_lo_bandstop", "psd_trim_stopband", "psd_time_statistic"),
+    },
+    # striqt cellular_5g_ssb_spectrogram (P2b-5): the symbol-aligned SSB burst
+    # view. subcarrier_spacing goes first — it defines the grid every other
+    # field (and the capture sample-rate retune) is judged against.
+    "ssb": {
+        "fields": {
+            "subcarrier_spacing":    "ssb_subcarrier_spacing",
+            "sample_rate":           "ssb_sample_rate",
+            "discovery_periodicity": "ssb_discovery_periodicity",
+            "frequency_offset":      "ssb_frequency_offset",
+            "max_block_count":       "ssb_max_block_count",
+            "window":                "ssb_window",
+            "lo_bandstop":           "ssb_lo_bandstop",
+        },
+        "virtual": (),
+        "order": ("ssb_subcarrier_spacing", "ssb_sample_rate",
+                  "ssb_discovery_periodicity", "ssb_frequency_offset",
+                  "ssb_max_block_count", "ssb_window", "ssb_lo_bandstop"),
+    },
+}
+
+# RadioConfig fields that are only settable through the validated "analysis"
+# block (the union across targets). Stripped from the top level of every
+# control message so no client can bypass the freedom model.
+ANALYSIS_CFG_KEYS = frozenset(
+    cfg_key
+    for target in ANALYSIS_TARGETS.values()
+    for cfg_key in target["fields"].values()
+)
+
+# Hard-default analysis values — the final revert target for the P2a-3 backstop
+# (identical to the RadioConfig field defaults).
+ANALYSIS_DEFAULTS = {
+    "window":                DEFAULT_WINDOW,
+    "fractional_overlap":    DEFAULT_FRACTIONAL_OVERLAP,
+    "window_fill":           DEFAULT_WINDOW_FILL,
+    "integration_bandwidth": DEFAULT_INTEGRATION_BW,
+    "lo_bandstop":           DEFAULT_LO_BANDSTOP,
+    "trim_stopband":         DEFAULT_TRIM_STOPBAND,
+    "time_aperture":         None,
+    "psd_window":                DEFAULT_WINDOW,
+    "psd_fractional_overlap":    DEFAULT_FRACTIONAL_OVERLAP,
+    "psd_window_fill":           DEFAULT_WINDOW_FILL,
+    "psd_integration_bandwidth": DEFAULT_INTEGRATION_BW,
+    "psd_lo_bandstop":           DEFAULT_LO_BANDSTOP,
+    "psd_trim_stopband":         DEFAULT_TRIM_STOPBAND,
+    "psd_time_statistic":        DEFAULT_PSD_TIME_STATISTIC,
+    "ssb_subcarrier_spacing":    SSB_SUBCARRIER_SPACING,
+    "ssb_sample_rate":           SSB_SAMPLE_RATE,
+    "ssb_discovery_periodicity": SSB_DISCOVERY_PERIOD,
+    "ssb_frequency_offset":      0.0,
+    "ssb_max_block_count":       None,
+    "ssb_window":                SSB_WINDOW,
+    "ssb_lo_bandstop":           SSB_LO_BANDSTOP,
+}
+
+
+def _parse_window(value):
+    """Normalize a window spec to what scipy get_window accepts: a name string
+    or a (name, float parameter) tuple. Accepts "kaiser, 11.88" shorthand and
+    the JSON list form ["kaiser", 11.88]. Raises ValueError on bad structure."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("window must not be empty")
+        if "," in text:
+            name, _, param = text.partition(",")
+            name, param = name.strip(), param.strip()
+            try:
+                return (name, float(param))
+            except ValueError:
+                raise ValueError(f"window parameter {param!r} is not a number")
+        return text
+    if isinstance(value, (list, tuple)) and len(value) == 2 and isinstance(value[0], str):
+        try:
+            return (str(value[0]), float(value[1]))
+        except (TypeError, ValueError):
+            raise ValueError(f"window parameter {value[1]!r} is not a number")
+    raise ValueError("window must be a name or name,parameter (scipy get_window spec)")
+
+
+def _parse_fraction(value) -> Fraction:
+    """Parse "13/28", a float, or an int into a Fraction. Raises ValueError."""
+    if isinstance(value, str):
+        value = value.strip()
+    try:
+        return Fraction(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        raise ValueError(f"{value!r} is not a fraction (use e.g. 13/28 or 0.464)")
+
+
+def _parse_optional_hz(value, *, auto_ok: bool = False):
+    """Parse a nullable Hz field: None/""/"none"/"off"/0 → None; "auto" → "auto"
+    (when allowed); otherwise a float Hz value. Raises ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "none", "null", "off"):
+            return None
+        if auto_ok and text == "auto":
+            return "auto"
+        value = text
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{value!r} is not a bandwidth in Hz"
+                         + (" (or 'auto'/'none')" if auto_ok else " (or 'none')"))
+    if value == 0:
+        return None
+    return value
+
+
+def _parse_time_statistic(value):
+    """Parse the PSD time_statistic surface: a list (or comma string) of named
+    statistics ('mean', 'max', …) and/or quantiles in [0, 1], e.g.
+    "mean, 0.5, 0.95, max". Returns a de-duplicated tuple of str/float.
+    Structure and quantile range are judged here (knowable); unknown statistic
+    NAMES are left for striqt itself to judge in tier 2. Raises ValueError."""
+    if isinstance(value, str):
+        tokens = [t.strip() for t in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        tokens = list(value)
+    else:
+        raise ValueError("time_statistic must be a list like mean, 0.95, max")
+    out = []
+    for tok in tokens:
+        if isinstance(tok, str):
+            tok = tok.strip().lower()
+            if not tok:
+                continue
+            try:
+                tok = float(tok)
+            except ValueError:
+                out.append(tok)
+                continue
+        if isinstance(tok, bool) or not isinstance(tok, (int, float)):
+            raise ValueError(f"{tok!r} is not a statistic name or quantile")
+        q = float(tok)
+        if not (0.0 <= q <= 1.0):
+            raise ValueError(
+                f"quantile {q!r} is out of range — entries must be statistic "
+                f"names (mean/max/…) or quantiles in [0, 1]"
+            )
+        out.append(q)
+    seen, dedup = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+    if not dedup:
+        raise ValueError("time_statistic needs at least one entry (e.g. mean)")
+    return tuple(dedup)
+
+
+def _parse_optional_seconds(value):
+    """Parse a nullable seconds field: None/""/"none"/"off"/0 → None; otherwise
+    a positive, finite float in seconds. Raises ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "none", "null", "off"):
+            return None
+        value = text
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{value!r} is not a duration in seconds (or 'none')")
+    if value == 0:
+        return None
+    if not (value > 0 and math.isfinite(value)):
+        raise ValueError("must be a positive, finite duration in seconds (or 'none')")
+    return value
+
+
+def scratch_validate_spectrogram(cfg: "RadioConfig"):
+    """
+    Tier 2 of the freedom model: judge a proposed analysis config the only way
+    that is always right — by asking striqt. Builds the exact Spectrogram spec
+    the live Computer would run and evaluates it on a tiny synthetic buffer
+    (2 STFT rows of zeros, single channel) WITHOUT touching the live ring or
+    acquirer. Returns the striqt error text when the config is illegal, or None
+    when it is safe to swap into the live stream.
+    """
+    if not _ANALYSIS_OK:
+        return None   # nothing to judge without striqt (quicklook-only install)
+    try:
+        sample_rate = float(cfg.sample_rate)
+        nfft   = aligned_nfft(cfg.nfft)
+        hop    = analysis_hop(nfft, cfg.fractional_overlap)
+        # Give the scratch run enough STFT rows that a configured time_aperture
+        # produces at least one averaged output row — otherwise a legal aperture
+        # would be judged on an empty result instead of striqt's real verdict.
+        rows_scratch = 2
+        if cfg.time_aperture:
+            rows_scratch = max(2, round(float(cfg.time_aperture) * sample_rate / hop))
+        needed = calibrated_sample_count(nfft, rows_scratch, hop)
+        spec   = make_analysis_spec(cfg, nfft, sample_rate)   # construction may raise
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float(cfg.analysis_bandwidth),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        with warnings.catch_warnings():
+            # The 2-row zero buffer is degenerate on purpose; numeric warnings
+            # (empty-slice means etc.) are expected noise, not verdicts.
+            warnings.simplefilter("ignore")
+            striqt_shared.evaluate_spectrogram(tiny, capture, spec, dtype="float32", dB=True)
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
+def scratch_validate_psd(cfg: "RadioConfig"):
+    """
+    Tier-2 judge for the PSD target (P2b-3): run striqt's real
+    power_spectral_density on a tiny synthetic buffer (2 STFT rows, single
+    channel) with the exact kwargs the live compute would use. Returns the
+    striqt error text on an illegal config (e.g. an unknown statistic name),
+    or None when it is safe to go live.
+    """
+    if not _ANALYSIS_OK:
+        return None
+    try:
+        sample_rate = float(cfg.sample_rate)
+        nfft   = aligned_nfft(cfg.nfft)
+        hop    = analysis_hop(nfft, cfg.psd_fractional_overlap)
+        needed = calibrated_sample_count(nfft, 2, hop)
+        kwargs = make_psd_kwargs(cfg, nfft, sample_rate)   # construction may raise
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float(cfg.analysis_bandwidth),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            striqt_measurements.power_spectral_density(
+                tiny, capture, as_xarray=False, **kwargs
+            )
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
+def scratch_validate_ssb(cfg: "RadioConfig"):
+    """
+    Tier-2 judge for the SSB target (P2b-5): run striqt's real
+    cellular_5g_ssb_spectrogram on a one-burst-set synthetic buffer with the
+    exact kwargs the live compute would use. cfg.sample_rate must already be
+    on the SSB grid for cfg's subcarrier spacing (the tier-1 branch retunes
+    the effective rate before probing). Returns the striqt error text when a
+    param combination is illegal, or None when it is safe to go live.
+    """
+    if not _ANALYSIS_OK:
+        return None
+    try:
+        sample_rate = float(cfg.sample_rate)
+        geo = ssb_geometry(cfg)   # off-grid raises → worded rejection
+        needed = ssb_block_samples(geo, 1)
+        kwargs = make_ssb_kwargs(cfg)
+        capture = analysis_specs.Capture(
+            sample_rate=sample_rate,
+            duration=needed / sample_rate,
+            analysis_bandwidth=float("inf"),
+        )
+        tiny = np.zeros((1, needed), dtype=np.complex64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            striqt_measurements.cellular_5g_ssb_spectrogram(
+                tiny, capture, as_xarray=False, **kwargs
+            )
+    except Exception as e:
+        return str(e).strip() or type(e).__name__
+    return None
+
+
+# Tier-2 scratch validators, one per analysis target (P2b-1). Each judges a
+# proposed RadioConfig by running the target's real striqt pipeline on a tiny
+# synthetic buffer — never the live ring.
+SCRATCH_VALIDATORS = {
+    "spectrogram": scratch_validate_spectrogram,
+    "psd":         scratch_validate_psd,
+    "ssb":         scratch_validate_ssb,
+}
+
+
+def scratch_validate_analysis(cfg: "RadioConfig", target: str = "spectrogram"):
+    fn = SCRATCH_VALIDATORS.get(target)
+    return fn(cfg) if fn else None
+
+
+# ---------------------------------------------------------------------------
 # Shared radio config (thread-safe)
 # ---------------------------------------------------------------------------
 
@@ -412,6 +797,64 @@ class RadioConfig:
     rows:        int   = DEFAULT_ROWS
     backend:     str   = SPEC_BACKEND
     lo_null:     bool  = True
+    # Displayed time span in seconds (P2a-4). When > 0, duration OWNS rows: they
+    # are re-derived hop-aware (duration·fs / row_hop) on every change to nfft/
+    # backend/overlap/sample_rate. 0 = legacy rows-driven mode (an explicit
+    # top-level {"rows": N} control reclaims ownership by zeroing this).
+    duration:    float = 0.0
+    # Capture knobs surfaced by the schema editor (P1-2). Defaults reproduce the
+    # values make_capture used to hardcode, so behaviour is unchanged until the
+    # user edits them. backend_sample_rate == 0 means "track sample_rate".
+    analysis_bandwidth:  float = float("inf")
+    lo_shift:            str   = "none"
+    host_resample:       bool  = False
+    backend_sample_rate: float = 0.0
+    # striqt Spectrogram analysis params (P2a-1) — drive the calibrated backend's
+    # spec instead of the old hardcodes. All immutable values (str/tuple/Fraction/
+    # None), so snapshot() can pass them through. Only validated values may land
+    # here (the freedom model in SharedConfig.update guards every write).
+    #   window:                scipy get_window spec — a name or (name, param)
+    #   fractional_overlap:    Fraction of each FFT window shared with its neighbor
+    #   window_fill:           Fraction of the window filled by the taper (rest zeros)
+    #   integration_bandwidth: "auto" (freq_res × averaging_factor), None, or Hz
+    #   lo_bandstop:           None or Hz nulled at DC by striqt
+    #   trim_stopband:         trim the frequency axis to analysis_bandwidth
+    window:                object = DEFAULT_WINDOW
+    fractional_overlap:    Fraction = DEFAULT_FRACTIONAL_OVERLAP
+    window_fill:           Fraction = DEFAULT_WINDOW_FILL
+    integration_bandwidth: object = DEFAULT_INTEGRATION_BW
+    lo_bandstop:           object = DEFAULT_LO_BANDSTOP
+    trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
+    #   time_aperture:         None, or seconds of binned RMS averaging along the
+    #                          time axis (striqt requires a multiple of hop/fs)
+    time_aperture:         object = None
+    # striqt PowerSpectralDensity analysis params (P2b-3) — an independent block
+    # so tuning the PSD view never disturbs the spectrogram recipe. Same field
+    # semantics as the spectrogram block, plus:
+    #   psd_time_statistic:  tuple of named statistics/quantiles evaluated along
+    #                        the time axis — one PSD trace per entry
+    psd_window:                object = DEFAULT_WINDOW
+    psd_fractional_overlap:    Fraction = DEFAULT_FRACTIONAL_OVERLAP
+    psd_window_fill:           Fraction = DEFAULT_WINDOW_FILL
+    psd_integration_bandwidth: object = DEFAULT_INTEGRATION_BW
+    psd_lo_bandstop:           object = DEFAULT_LO_BANDSTOP
+    psd_trim_stopband:         bool   = DEFAULT_TRIM_STOPBAND
+    psd_time_statistic:        tuple  = DEFAULT_PSD_TIME_STATISTIC
+    # striqt Cellular5GNRSSBSpectrogram analysis params (P2b-5) — defaults are
+    # the exact values the SSB path hardcoded before, so behaviour is unchanged
+    # until edited from the Analysis panel.
+    #   ssb_subcarrier_spacing:    3GPP SCS in Hz (15e3/30e3/60e3 …)
+    #   ssb_sample_rate:           output rate of the recentered SSB band (S/s)
+    #   ssb_discovery_periodicity: time between synchronization bursts (s)
+    #   ssb_frequency_offset:      SSB center offset from the capture center (Hz)
+    #   ssb_max_block_count:       None, or a cap on bursts evaluated per frame
+    ssb_subcarrier_spacing:    float  = SSB_SUBCARRIER_SPACING
+    ssb_sample_rate:           float  = SSB_SAMPLE_RATE
+    ssb_discovery_periodicity: float  = SSB_DISCOVERY_PERIOD
+    ssb_frequency_offset:      float  = 0.0
+    ssb_max_block_count:       object = None
+    ssb_window:                object = SSB_WINDOW
+    ssb_lo_bandstop:           object = SSB_LO_BANDSTOP
 
     def snapshot(self):
         return RadioConfig(
@@ -422,6 +865,32 @@ class RadioConfig:
             rows=int(self.rows),
             backend=str(self.backend),
             lo_null=bool(self.lo_null),
+            duration=float(self.duration),
+            analysis_bandwidth=float(self.analysis_bandwidth),
+            lo_shift=str(self.lo_shift),
+            host_resample=bool(self.host_resample),
+            backend_sample_rate=float(self.backend_sample_rate),
+            window=self.window,
+            fractional_overlap=self.fractional_overlap,
+            window_fill=self.window_fill,
+            integration_bandwidth=self.integration_bandwidth,
+            lo_bandstop=self.lo_bandstop,
+            trim_stopband=bool(self.trim_stopband),
+            time_aperture=self.time_aperture,
+            psd_window=self.psd_window,
+            psd_fractional_overlap=self.psd_fractional_overlap,
+            psd_window_fill=self.psd_window_fill,
+            psd_integration_bandwidth=self.psd_integration_bandwidth,
+            psd_lo_bandstop=self.psd_lo_bandstop,
+            psd_trim_stopband=bool(self.psd_trim_stopband),
+            psd_time_statistic=tuple(self.psd_time_statistic),
+            ssb_subcarrier_spacing=float(self.ssb_subcarrier_spacing),
+            ssb_sample_rate=float(self.ssb_sample_rate),
+            ssb_discovery_periodicity=float(self.ssb_discovery_periodicity),
+            ssb_frequency_offset=float(self.ssb_frequency_offset),
+            ssb_max_block_count=self.ssb_max_block_count,
+            ssb_window=self.ssb_window,
+            ssb_lo_bandstop=self.ssb_lo_bandstop,
         )
 
 
@@ -431,18 +900,608 @@ class SharedConfig:
         self._cfg   = RadioConfig(backend=SPEC_BACKEND)
         self._dirty = False
         self._stop  = False
+        # P2a-3 backstop state: the analysis params of the last config that
+        # demonstrably computed a frame, and notices queued for the viewers.
+        self._last_good_analysis = None
+        self._notices = []
+        # Tier-2 probe handoff (P2a-5): striqt's persistent window cache is a
+        # process-wide shelf that (on dbm.sqlite3 Pythons) is bound to the
+        # thread that first used it — the compute thread. Scratch validations
+        # therefore run THERE, posted through this single-slot mailbox.
+        self._probe_lock = threading.Lock()   # serializes probers
+        self._probe_req  = None               # (seq, RadioConfig) or None
+        self._probe_res  = None               # (seq, verdict)
+        self._probe_seq  = 0
+        self._probe_done = threading.Event()
 
     def snapshot(self):
         with self._lock:
             return self._cfg.snapshot()
 
+    # --- Compute backstop (P2a-3) ---------------------------------------------
+
+    def note_good_analysis(self, cfg: "RadioConfig"):
+        """Remember the analysis params that just computed a frame successfully —
+        the revert target if a later config slips past validation and throws."""
+        good = {k: getattr(cfg, k) for k in ANALYSIS_CFG_KEYS}
+        with self._lock:
+            self._last_good_analysis = good
+
+    def revert_analysis(self, reason: str):
+        """
+        Backstop (belt and suspenders): the compute path caught an exception even
+        though tiers 1–2 should have prevented it. Revert the analysis params to
+        the last-good set (or the shipped defaults), keep streaming, and queue a
+        notice for the viewers. Returns the sorted reverted field names, or None
+        when the current params already match every revert target — i.e. the
+        error is not analysis-induced and reverting would change nothing.
+        """
+        with self._lock:
+            current = {k: getattr(self._cfg, k) for k in ANALYSIS_CFG_KEYS}
+            target = None
+            for candidate in (self._last_good_analysis, ANALYSIS_DEFAULTS):
+                if candidate and any(candidate[k] != current[k] for k in ANALYSIS_CFG_KEYS):
+                    target = candidate
+                    break
+            if target is None:
+                return None
+            changed = []
+            for key in ANALYSIS_CFG_KEYS:
+                if current[key] != target[key]:
+                    setattr(self._cfg, key, target[key])
+                    changed.append(key)
+            # The reverted overlap may have widened the per-row hop — re-clamp
+            # rows so the Computer's avail >= need gate stays reachable.
+            max_rows = max_live_rows(self._cfg)
+            if self._cfg.rows > max_rows:
+                self._cfg.rows = max_rows
+            changed = sorted(changed)
+        self.push_notice(
+            f"analysis error: {reason} — reverted {', '.join(changed)} to last-good values"
+        )
+        return changed
+
+    def probe_analysis(self, trial_cfg: "RadioConfig", target: str = "spectrogram"):
+        """
+        Tier-2 scratch validation, executed on the compute thread. striqt's
+        get_window carries a persistent on-disk cache whose handle is bound to
+        the thread that first used it (dbm.sqlite3 refuses cross-thread use);
+        the compute thread is that owner, so verdicts from anywhere else could
+        report a spurious threading error instead of the real one. Falls back
+        to an inline judgement if no compute thread services the request in
+        time (startup) — the tier-3 backstop still protects the stream.
+        """
+        if not _ANALYSIS_OK:
+            return None
+        with self._probe_lock:
+            self._probe_seq += 1
+            seq = self._probe_seq
+            self._probe_done.clear()
+            self._probe_req = (seq, trial_cfg, target)
+            if self._probe_done.wait(2.0):
+                res = self._probe_res
+                if res and res[0] == seq:
+                    return res[1]
+            self._probe_req = None
+            return scratch_validate_analysis(trial_cfg, target)
+
+    def service_probe(self):
+        """Called by the compute thread every loop: run a pending tier-2 probe."""
+        job = self._probe_req
+        if job is None:
+            return
+        self._probe_req = None
+        seq, trial_cfg, target = job
+        self._probe_res = (seq, scratch_validate_analysis(trial_cfg, target))
+        self._probe_done.set()
+
+    def push_notice(self, message: str):
+        with self._lock:
+            self._notices.append(str(message))
+            del self._notices[:-20]   # keep only the newest if no viewer drains
+
+    def drain_notices(self):
+        with self._lock:
+            notices, self._notices = self._notices, []
+            return notices
+
+    def _effective_radio(self, update: dict):
+        """
+        Effective radio params for THIS message (LV-R9b): validation must see
+        the nfft/sample_rate/backend the message itself is applying (already
+        mapped to the top level by the capture branch), not the stale cfg.
+        """
+        eff = self.snapshot()
+        try:
+            if update.get("sample_rate") is not None:
+                eff.sample_rate = float(
+                    max(1e6, min(_snap(float(update["sample_rate"]), RATES_HZ), 125e6))
+                )
+            if update.get("nfft") is not None:
+                eff.nfft = int(_snap(int(update["nfft"]), NFFT_CHOICES))
+            if update.get("backend") is not None:
+                backend = str(update["backend"]).strip().lower()
+                if backend in BACKENDS:
+                    eff.backend = backend
+        except (TypeError, ValueError):
+            pass
+        return eff
+
+    def _tier1_freq_fields(self, req, eff, *, cfg_prefix, ack_prefix,
+                           on_calibrated_grid, rounded, rejected):
+        """
+        Tier-1 snap rules (knowable constraints → round and tell) for the
+        FrequencyAnalysisSpecBase fields shared by the spectrogram and PSD
+        analyses: window / frequency_resolution / fractional_overlap /
+        window_fill / integration_bandwidth / lo_bandstop / trim_stopband.
+        `cfg_prefix` maps the message field onto the target's RadioConfig
+        attribute (e.g. "psd_" + "window"); `ack_prefix` labels the ack entries.
+        Returns (accepted, ack_field, requested_map) keyed by RadioConfig key.
+        """
+        accepted = {}          # cfg key -> validated value
+        ack_field = {}         # cfg key -> field name reported in the ack
+        requested_map = {}     # cfg key -> the raw requested value
+
+        def tell(field, requested, used, reason):
+            rounded.append({
+                "field": ack_prefix + field, "requested": requested,
+                "used": used, "reason": reason,
+            })
+
+        def reject(field, requested, reason):
+            rejected.append({"field": ack_prefix + field,
+                             "requested": requested, "reason": reason})
+
+        # --- frequency_resolution: the second view of nfft (tier 1) ----------
+        # cfg.nfft owns this quantity (P2a-1); an edit here snaps to the nearest
+        # FFT size and the executed resolution is reported back.
+        if req.get("frequency_resolution") is not None:
+            requested = req["frequency_resolution"]
+            try:
+                fr = float(requested)
+                if not (fr > 0 and math.isfinite(fr)):
+                    raise ValueError("frequency_resolution must be a positive, finite Hz value")
+                nfft_snap = int(_snap(eff.sample_rate / fr, NFFT_CHOICES))
+                eff.nfft = nfft_snap
+                accepted["nfft"] = nfft_snap
+                ack_field["nfft"] = ack_prefix + "frequency_resolution"
+                requested_map["nfft"] = requested
+                executed_nfft = aligned_nfft(nfft_snap) if on_calibrated_grid else nfft_snap
+                used = eff.sample_rate / executed_nfft
+                if abs(used - fr) > 1e-6 * max(fr, 1.0):
+                    reason = f"FFT size owns this quantity; snapped to nfft {nfft_snap}"
+                    if executed_nfft != nfft_snap:
+                        reason += (f" (calibrated grid runs {executed_nfft}, "
+                                   f"a 28-multiple, for window_fill integrality)")
+                    tell("frequency_resolution", fr, used, reason)
+            except (TypeError, ValueError) as e:
+                reject("frequency_resolution", requested, str(e))
+
+        # Denominator grid for fraction snapping: the FFT size striqt executes.
+        nfft_axis = aligned_nfft(eff.nfft) if on_calibrated_grid else int(eff.nfft)
+        freq_res  = eff.sample_rate / nfft_axis
+
+        # --- fractional_overlap / window_fill: snap to k/nfft (tier 1) -------
+        for key, lo_k, hi_k, why in (
+            ("fractional_overlap", 0, nfft_axis - 1,
+             "overlap must be an integer sample count (k/nfft) below 1"),
+            ("window_fill", 1, nfft_axis,
+             "(1 - window_fill) x nfft must be an integer zero-fill (k/nfft)"),
+        ):
+            if req.get(key) is None:
+                continue
+            requested = req[key]
+            try:
+                frac = _parse_fraction(requested)
+                k = min(max(round(frac * nfft_axis), lo_k), hi_k)
+                snapped = Fraction(k, nfft_axis)
+                accepted[cfg_prefix + key] = snapped
+                ack_field[cfg_prefix + key] = ack_prefix + key
+                requested_map[cfg_prefix + key] = requested
+                if snapped != frac:
+                    tell(key, str(requested), str(snapped), why)
+            except ValueError as e:
+                reject(key, requested, str(e))
+
+        # --- integration_bandwidth: multiple of freq_res, "auto", or none ----
+        if "integration_bandwidth" in req and req["integration_bandwidth"] is not None:
+            requested = req["integration_bandwidth"]
+            try:
+                v = _parse_optional_hz(requested, auto_ok=True)
+                if v is None or isinstance(v, str):
+                    accepted[cfg_prefix + "integration_bandwidth"] = v
+                else:
+                    if v < 0:
+                        raise ValueError("integration_bandwidth must be positive, 'auto', or 'none'")
+                    factor = min(max(1, round(v / freq_res)), nfft_axis)
+                    used = factor * freq_res
+                    accepted[cfg_prefix + "integration_bandwidth"] = used
+                    if abs(used - v) > 1e-6 * max(v, 1.0):
+                        tell("integration_bandwidth", v, used,
+                             f"must be an integer multiple of the {freq_res:.1f} Hz "
+                             f"frequency resolution (striqt); using {factor} bins")
+                ack_field[cfg_prefix + "integration_bandwidth"] = ack_prefix + "integration_bandwidth"
+                requested_map[cfg_prefix + "integration_bandwidth"] = requested
+            except ValueError as e:
+                reject("integration_bandwidth", requested, str(e))
+
+        # --- lo_bandstop: positive Hz within the sampled span, or none --------
+        if "lo_bandstop" in req and req["lo_bandstop"] is not None:
+            requested = req["lo_bandstop"]
+            try:
+                v = _parse_optional_hz(requested)
+                if v is not None:
+                    if v < 0:
+                        raise ValueError("lo_bandstop must be positive or 'none'")
+                    if v > eff.sample_rate:
+                        tell("lo_bandstop", v, eff.sample_rate,
+                             "cannot exceed the sampled span (sample_rate)")
+                        v = float(eff.sample_rate)
+                accepted[cfg_prefix + "lo_bandstop"] = v
+                ack_field[cfg_prefix + "lo_bandstop"] = ack_prefix + "lo_bandstop"
+                requested_map[cfg_prefix + "lo_bandstop"] = requested
+            except ValueError as e:
+                reject("lo_bandstop", requested, str(e))
+
+        # --- trim_stopband / window --------------------------------------------
+        if "trim_stopband" in req and req["trim_stopband"] is not None:
+            accepted[cfg_prefix + "trim_stopband"] = bool(req["trim_stopband"])
+            ack_field[cfg_prefix + "trim_stopband"] = ack_prefix + "trim_stopband"
+            requested_map[cfg_prefix + "trim_stopband"] = req["trim_stopband"]
+        if req.get("window") is not None:
+            try:
+                accepted[cfg_prefix + "window"] = _parse_window(req["window"])
+                ack_field[cfg_prefix + "window"] = ack_prefix + "window"
+                requested_map[cfg_prefix + "window"] = req["window"]
+            except ValueError as e:
+                reject("window", req["window"], str(e))
+
+        return accepted, ack_field, requested_map
+
+    def _validate_analysis(self, update: dict):
+        """
+        Freedom-model gate (P2a-2, generalized across analysis targets in
+        P2b-1) for the "analysis" block of a control message. The block's
+        optional "target" key routes to the analysis being configured
+        (spectrogram is the default — the P2a wire format is unchanged).
+        Never mutates the live config — returns (survivors, rounded, rejected,
+        ignored) where `survivors` maps RadioConfig keys to values that passed
+        tier 1 (knowable rules → snap and tell) AND tier 2 (striqt scratch
+        validation on a tiny buffer). `rounded`/`rejected` are the ack entries:
+        [{field, requested, used, reason}] / [{field, requested, reason}].
+        """
+        req = dict(update.get("analysis") or {})
+        target = str(req.pop("target", "spectrogram") or "spectrogram").strip().lower()
+        rounded, rejected = [], []
+        if target not in ANALYSIS_TARGETS:
+            known = ", ".join(sorted(ANALYSIS_TARGETS))
+            rejected.append({"field": "target", "requested": target,
+                             "reason": f"unknown analysis target (known: {known})"})
+            return {}, rounded, rejected, []
+        spec = ANALYSIS_TARGETS[target]
+
+        eff = self._effective_radio(update)
+        # The spectrogram/PSD analysis pipelines ALWAYS execute on the aligned
+        # 28-multiple grid (their scratch validators and compute paths use
+        # aligned_nfft unconditionally), so tier-1 fraction snapping must use
+        # that grid regardless of which backend happens to be displayed —
+        # otherwise a value snapped to k/1024 in quicklook would break the
+        # window_fill integrality check the moment the calibrated view returns.
+        on_calibrated_grid = target in {"spectrogram", "psd"} or (
+            eff.backend in CALIBRATED_GRID_BACKENDS
+        )
+
+        # --- Tier 1: knowable rules, routed per target ------------------------
+        accepted, ack_field, requested_map = self._tier1_target(
+            target, req, eff, on_calibrated_grid, rounded, rejected
+        )
+
+        supported = set(spec["fields"]) | set(spec["virtual"])
+        ignored = sorted(
+            f"analysis.{k}" for k, v in req.items()
+            if v is not None and k not in supported
+        )
+
+        # --- Tier 2: only striqt can judge — scratch-validate off-line -------
+        # Apply the accepted fields one at a time onto a working copy so a
+        # failure is attributed to the field that caused it; survivors keep
+        # applying. The live config is untouched until update() commits the
+        # survivors (never the rejects).
+        candidate = eff.snapshot()
+        for reset_key in spec.get("probe_reset", ()):
+            if reset_key in accepted:
+                setattr(candidate, reset_key, None)
+        survivors = {}
+        for key in (k for k in spec["order"] if k in accepted):
+            trial = candidate.snapshot()
+            setattr(trial, key, accepted[key])
+            err = self.probe_analysis(trial, target)
+            if err is None:
+                candidate = trial
+                survivors[key] = accepted[key]
+            else:
+                field = ack_field.get(key, key)
+                rejected.append({"field": field,
+                                 "requested": requested_map.get(key), "reason": err})
+                rounded[:] = [r for r in rounded if r["field"] != field]
+        return survivors, rounded, rejected, ignored
+
+    def _tier1_target(self, target, req, eff, on_calibrated_grid, rounded, rejected):
+        """Dispatch tier-1 validation for one analysis target. Returns
+        (accepted, ack_field, requested_map) keyed by RadioConfig key."""
+        if target == "spectrogram":
+            accepted, ack_field, requested_map = self._tier1_freq_fields(
+                req, eff, cfg_prefix="", ack_prefix="",
+                on_calibrated_grid=on_calibrated_grid,
+                rounded=rounded, rejected=rejected,
+            )
+            self._tier1_time_aperture(
+                req, eff, on_calibrated_grid,
+                accepted, ack_field, requested_map, rounded, rejected,
+            )
+            return accepted, ack_field, requested_map
+        if target == "psd":
+            accepted, ack_field, requested_map = self._tier1_freq_fields(
+                req, eff, cfg_prefix="psd_", ack_prefix="psd.",
+                on_calibrated_grid=on_calibrated_grid,
+                rounded=rounded, rejected=rejected,
+            )
+            if req.get("time_statistic") is not None:
+                requested = req["time_statistic"]
+                try:
+                    accepted["psd_time_statistic"] = _parse_time_statistic(requested)
+                    ack_field["psd_time_statistic"] = "psd.time_statistic"
+                    requested_map["psd_time_statistic"] = requested
+                except ValueError as e:
+                    rejected.append({"field": "psd.time_statistic",
+                                     "requested": requested, "reason": str(e)})
+            return accepted, ack_field, requested_map
+        if target == "ssb":
+            return self._tier1_ssb(req, eff, rounded, rejected)
+        raise RuntimeError(f"no tier-1 validator for analysis target {target!r}")
+
+    def _tier1_ssb(self, req, eff, rounded, rejected):
+        """
+        Tier-1 snap rules for the SSB target (P2b-5). Knowable constraints:
+        the subcarrier spacing must admit a compatible capture rate (14·scs ≤
+        SSB_MAX_RATE); the output rate can't exceed the sampled span; the
+        discovery periodicity must cover at least one burst set (2 ms of
+        symbols for every SCS) and one period must fit the IQ ring; the
+        frequency offset must stay inside the sampled span; max_block_count is
+        a whole number of burst sets or none. Everything subtler goes to the
+        tier-2 scratch run. eff.sample_rate is moved onto the SSB grid the
+        retune would pick, so the probes judge the config that would go live.
+        """
+        accepted, ack_field, requested_map = {}, {}, {}
+
+        def tell(field, requested, used, reason):
+            rounded.append({"field": "ssb." + field, "requested": requested,
+                            "used": used, "reason": reason})
+
+        def reject(field, requested, reason):
+            rejected.append({"field": "ssb." + field,
+                             "requested": requested, "reason": reason})
+
+        def take(field, cfg_key, value):
+            accepted[cfg_key] = value
+            ack_field[cfg_key] = "ssb." + field
+            requested_map[cfg_key] = req.get(field)
+
+        if req.get("subcarrier_spacing") is not None:
+            requested = req["subcarrier_spacing"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("subcarrier spacing must be a positive, finite Hz value")
+                snapped = min(max(v, 1e3), SSB_MAX_RATE / 14.0)
+                if snapped != v:
+                    tell("subcarrier_spacing", v, snapped,
+                         f"the compatible capture rate 14·scs must stay within "
+                         f"{SSB_MAX_RATE / 1e6:g} MS/s, and scs ≥ 1 kHz keeps the "
+                         f"live FFT tractable")
+                take("subcarrier_spacing", "ssb_subcarrier_spacing", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("subcarrier_spacing", requested, str(e))
+
+        scs_eff = float(accepted.get("ssb_subcarrier_spacing",
+                                     eff.ssb_subcarrier_spacing))
+
+        # Probe at the capture rate the SSB retune would arm (update() commits
+        # the real retune and reports it), so tier-2 judges the true config.
+        if not ssb_grid_compatible(eff.sample_rate, scs_eff):
+            compatible = ssb_compatible_rate(eff.sample_rate, scs_eff)
+            if compatible:
+                eff.sample_rate = float(compatible)
+
+        if req.get("sample_rate") is not None:
+            requested = req["sample_rate"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("SSB output rate must be a positive, finite S/s value")
+                if v > eff.sample_rate:
+                    tell("sample_rate", v, eff.sample_rate,
+                         "the SSB output band cannot exceed the sampled span")
+                    v = float(eff.sample_rate)
+                take("sample_rate", "ssb_sample_rate", float(v))
+            except (TypeError, ValueError) as e:
+                reject("sample_rate", requested, str(e))
+
+        if req.get("discovery_periodicity") is not None:
+            requested = req["discovery_periodicity"]
+            try:
+                v = float(requested)
+                if not (v > 0 and math.isfinite(v)):
+                    raise ValueError("discovery periodicity must be a positive, finite duration in seconds")
+                burst_span = 2e-3   # symbol_rows·hop/fs == 2 ms for every SCS
+                ring_cap = int(MAX_TAIL * RING_ROW_FILL) / eff.sample_rate
+                snapped = min(max(v, burst_span), ring_cap)
+                if snapped != v:
+                    tell("discovery_periodicity", v, snapped,
+                         "must cover at least one 2 ms burst set and one period "
+                         "must fit the IQ ring")
+                take("discovery_periodicity", "ssb_discovery_periodicity", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("discovery_periodicity", requested, str(e))
+
+        if req.get("frequency_offset") is not None:
+            requested = req["frequency_offset"]
+            try:
+                v = float(requested)
+                if not math.isfinite(v):
+                    raise ValueError("frequency offset must be a finite Hz value")
+                # The truncated SSB band must fit the sampled span:
+                # |offset| + ssb_rate/2 ≤ fs/2 (striqt raises otherwise).
+                ssb_rate_eff = min(
+                    float(accepted.get("ssb_sample_rate", eff.ssb_sample_rate)),
+                    float(eff.sample_rate),
+                )
+                half = max(0.0, (eff.sample_rate - ssb_rate_eff) / 2.0)
+                clamped = min(max(v, -half), half)
+                # striqt's truncate_freqs also requires the offset on the
+                # averaged subcarrier grid: a multiple of scs (knowable →
+                # snap & tell; confirmed against the striqt error text).
+                bin_hz = scs_eff
+                snapped = round(clamped / bin_hz) * bin_hz
+                if abs(snapped - v) > 1e-6 * max(abs(v), 1.0):
+                    tell("frequency_offset", v, snapped,
+                         f"must be a multiple of the subcarrier spacing "
+                         f"{bin_hz / 1e3:g} kHz and keep the {ssb_rate_eff / 1e6:g} "
+                         f"MS/s SSB band inside the sampled span")
+                take("frequency_offset", "ssb_frequency_offset", float(snapped))
+            except (TypeError, ValueError) as e:
+                reject("frequency_offset", requested, str(e))
+
+        if "max_block_count" in req and req["max_block_count"] is not None:
+            requested = req["max_block_count"]
+            try:
+                v = requested
+                if isinstance(v, str):
+                    text = v.strip().lower()
+                    v = None if text in ("", "none", "null", "off") else float(text)
+                elif isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError("max_block_count must be a whole number of burst sets or 'none'")
+                if v is not None:
+                    if not math.isfinite(v) or v <= 0:
+                        v = None
+                    else:
+                        k = max(1, round(v))
+                        if k != v:
+                            tell("max_block_count", v, k,
+                                 "must be a whole number of burst sets")
+                        v = int(k)
+                take("max_block_count", "ssb_max_block_count", v)
+            except (TypeError, ValueError) as e:
+                reject("max_block_count", requested, str(e))
+
+        if req.get("window") is not None:
+            try:
+                take("window", "ssb_window", _parse_window(req["window"]))
+            except ValueError as e:
+                reject("window", req["window"], str(e))
+
+        if "lo_bandstop" in req and req["lo_bandstop"] is not None:
+            requested = req["lo_bandstop"]
+            try:
+                v = _parse_optional_hz(requested)
+                if v is not None:
+                    if v < 0:
+                        raise ValueError("lo_bandstop must be positive or 'none'")
+                    if v > eff.sample_rate:
+                        tell("lo_bandstop", v, eff.sample_rate,
+                             "cannot exceed the sampled span (sample_rate)")
+                        v = float(eff.sample_rate)
+                take("lo_bandstop", "ssb_lo_bandstop", v)
+            except ValueError as e:
+                reject("lo_bandstop", requested, str(e))
+
+        return accepted, ack_field, requested_map
+
+    def _tier1_time_aperture(self, req, eff, on_calibrated_grid,
+                             accepted, ack_field, requested_map, rounded, rejected):
+        """
+        Tier-1 rule for the spectrogram time_aperture (P2b-2): striqt requires an
+        integer multiple of the row hop period hop/fs — where hop follows the
+        overlap/nfft THIS message may also be changing. Snaps a requested value
+        to the nearest hop multiple within one frame; when the message moves the
+        hop grid under an existing aperture, the aperture is re-snapped to the
+        new grid (reported), instead of letting the next frame throw.
+        """
+        nfft_eff = accepted.get("nfft", eff.nfft)
+        nfft_axis = aligned_nfft(nfft_eff) if on_calibrated_grid else int(nfft_eff)
+        overlap = accepted.get("fractional_overlap", eff.fractional_overlap)
+        hop = analysis_hop(nfft_axis, overlap)
+        hop_period = hop / float(eff.sample_rate)
+
+        requested = req.get("time_aperture")
+        if requested is not None:
+            try:
+                v = _parse_optional_seconds(requested)
+                if v is None:
+                    accepted["time_aperture"] = None
+                else:
+                    k = min(max(1, round(v / hop_period)), max(1, int(eff.rows)))
+                    used = k * hop_period
+                    accepted["time_aperture"] = used
+                    if abs(used - v) > 1e-9 * max(v, hop_period):
+                        rounded.append({
+                            "field": "time_aperture", "requested": v, "used": used,
+                            "reason": (f"must be an integer multiple of the row hop "
+                                       f"(1-overlap)·nfft/fs = {hop_period * 1e3:.4f} ms, "
+                                       f"within one frame; using {k} rows"),
+                        })
+                ack_field["time_aperture"] = "time_aperture"
+                requested_map["time_aperture"] = requested
+            except ValueError as e:
+                rejected.append({"field": "time_aperture",
+                                 "requested": requested, "reason": str(e)})
+        elif eff.time_aperture and ("nfft" in accepted or "fractional_overlap" in accepted):
+            # Follow-along: the hop grid moved and the standing aperture no longer
+            # divides it — re-snap (and tell) rather than let the live frame throw.
+            samples = round(float(eff.time_aperture) * float(eff.sample_rate))
+            if samples % hop != 0:
+                k = max(1, round(samples / hop))
+                used = k * hop_period
+                accepted["time_aperture"] = used
+                ack_field["time_aperture"] = "time_aperture"
+                requested_map["time_aperture"] = eff.time_aperture
+                rounded.append({
+                    "field": "time_aperture",
+                    "requested": float(eff.time_aperture), "used": used,
+                    "reason": "this message changed the row hop; re-snapped the "
+                              "standing time_aperture to the new hop grid",
+                })
+
     def update(self, update: dict) -> dict:
-        """Apply key/value updates. Returns an ack {applied, ignored, reconnect}."""
+        """
+        Apply key/value updates. Returns an ack
+        {applied, ignored, reconnect, rounded, rejected}.
+        """
+        # Analysis params are only settable through the validated "analysis"
+        # block — strip top-level occurrences so nothing bypasses the freedom
+        # model (P2a-2).
+        update = {k: v for k, v in update.items() if k not in ANALYSIS_CFG_KEYS}
         ignored = []
         reconnect = []
+        rounded = []
+        rejected = []
+        # An explicit top-level {"rows": N} control reclaims rows ownership from
+        # duration (P2a-4). Recorded before the capture branch merges its own
+        # duration-derived keys into the update.
+        explicit_rows = update.get("rows") is not None
         # Capture fields that map to a live radio parameter; the rest are rendered
         # by the editor but cannot be applied live — reported, not dropped (LV-F6).
-        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"}
+        # The four capture knobs below share their name with the cfg field, so they
+        # pass straight through (P1-2); they take effect on the next re-arm.
+        # `duration` is now a first-class cfg field (P2a-4): it maps straight
+        # through, and rows are derived from it hop-aware AFTER all of this
+        # message's changes land (see the post-loop derivation below) — so the
+        # mapping always uses the effective backend/nfft/overlap (LV-R9b).
+        passthru_capture = {
+            "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+            "duration",
+        }
+        capture_mapped = {"center_frequency", "sample_rate", "gain", "nfft"} | passthru_capture
         if "capture" in update and isinstance(update["capture"], dict):
             capture = update["capture"]
             mapped = {}
@@ -452,24 +1511,26 @@ class SharedConfig:
                 mapped["sample_rate"] = capture["sample_rate"]
             if capture.get("gain") is not None:
                 mapped["gain"] = capture["gain"]
-            if capture.get("duration") is not None:
-                try:
-                    with self._lock:
-                        cur_nfft = self._cfg.nfft
-                        cur_rate = self._cfg.sample_rate
-                    # Map duration→rows using values from THIS message when it also
-                    # changes them, not the pre-update cfg (LV-R9b).
-                    nfft        = capture.get("nfft") or cur_nfft
-                    sample_rate = capture.get("sample_rate") or cur_rate
-                    rows = round(float(capture["duration"]) * float(sample_rate) / max(int(nfft), 1))
-                    mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
-                except Exception:
-                    pass
+            if capture.get("nfft") is not None:
+                mapped["nfft"] = capture["nfft"]
+            for key in passthru_capture:
+                if capture.get(key) is not None:
+                    mapped[key] = capture[key]
             ignored = sorted(
                 k for k, v in capture.items() if v is not None and k not in capture_mapped
             )
             update = dict(update)
             update.update(mapped)
+
+        # Freedom-model analysis block (P2a-2): tier-1 snap + tier-2 striqt
+        # scratch validation. Only the survivors are merged into the update; the
+        # live cfg never sees a rejected value. Runs after the capture branch so
+        # it sees the nfft/sample_rate this same message is applying.
+        if "analysis" in update and isinstance(update["analysis"], dict):
+            survivors, rounded, rejected, analysis_ignored = self._validate_analysis(update)
+            ignored = sorted(set(ignored) | set(analysis_ignored))
+            update = dict(update)
+            update.update(survivors)
 
         if "source" in update and isinstance(update["source"], dict):
             reconnect = sorted(k for k, v in update["source"].items() if v is not None and k not in {
@@ -478,9 +1539,26 @@ class SharedConfig:
             if reconnect:
                 print(f"[config] source changes require reconnect: {reconnect}")
 
-        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null"}
+        valid = {
+            "center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null",
+            "analysis_bandwidth", "lo_shift", "host_resample", "backend_sample_rate",
+            "duration",
+        } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
+            # Effective backend/SCS for THIS message: an SSB-grid rate (e.g. the
+            # retuned 13.44 MS/s coming back from a server-seeded form) must not
+            # be snapped onto the LTE list only for the SSB retune to undo it —
+            # that round trip would dirty the config and re-arm the radio on
+            # every bare Apply.
+            eff_backend = str(update.get("backend", self._cfg.backend)).strip().lower()
+            if eff_backend not in BACKENDS:
+                eff_backend = self._cfg.backend
+            try:
+                eff_scs = float(update.get("ssb_subcarrier_spacing",
+                                           self._cfg.ssb_subcarrier_spacing))
+            except (TypeError, ValueError):
+                eff_scs = float(self._cfg.ssb_subcarrier_spacing)
             for key, value in update.items():
                 if key not in valid:
                     continue
@@ -488,17 +1566,49 @@ class SharedConfig:
                     value = str(value).strip().lower()
                     if value not in BACKENDS:
                         continue
-                elif key == "lo_null":
+                elif key in {"lo_null", "host_resample"}:
                     value = bool(value)
+                elif key == "lo_shift":
+                    # striqt LOShift is Literal['left','right','none'].
+                    value = str(value).strip().lower()
+                    if value not in {"left", "right", "none"}:
+                        continue
+                elif key == "analysis_bandwidth":
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (math.isinf(value) or value > 0):
+                        continue   # must be a positive bandwidth or inf (no limit)
+                elif key == "backend_sample_rate":
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if value < 0:
+                        continue   # 0 == track sample_rate; otherwise a positive rate
+                elif key in ANALYSIS_CFG_KEYS:
+                    # Already validated by _validate_analysis — only its
+                    # survivors reach this loop (top-level copies are stripped).
+                    pass
+                elif key == "duration":
+                    try:
+                        value = max(0.0, float(value))   # seconds; 0 = rows-driven
+                    except (TypeError, ValueError):
+                        continue
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
-                # Clamp rows so a misbehaving browser can't overload the radio
+                # Clamp rows to what the ring can supply for the current backend/
+                # nfft (P1-5). nfft, if changed in this same message, is applied
+                # earlier in the loop, so self._cfg already reflects it here.
                 if key == "rows":
-                    value = int(max(1, min(value, MAX_LIVE_ROWS)))
+                    value = int(max(1, min(value, max_live_rows(self._cfg))))
                 elif key == "center":
                     value = float(max(300e6, min(value, 6e9)))
                 elif key == "sample_rate":
-                    value = float(_snap(value, RATES_HZ))
+                    value = float(value)
+                    if not (eff_backend == "ssb" and ssb_grid_compatible(value, eff_scs)):
+                        value = float(_snap(value, RATES_HZ))
                     value = float(max(1e6, min(value, 125e6)))
                 elif key == "gain":
                     value = float(max(-60.0, min(value, 10.0)))
@@ -511,11 +1621,71 @@ class SharedConfig:
                 setattr(self._cfg, key, value)
                 changes.append((key, old, value))
             if changes:
+                # Rows ownership (P2a-4): an explicit top-level rows control
+                # reclaims rows-driven mode; otherwise a positive duration owns
+                # rows and re-derives them hop-aware from the FINAL state of
+                # this update (duration·fs / row_hop) — matching the client's
+                # time-axis label for any backend/nfft/overlap combination.
+                changed_keys = {k for k, _, _ in changes}
+                if explicit_rows and "duration" not in changed_keys and self._cfg.duration:
+                    changes.append(("duration", self._cfg.duration, 0.0))
+                    self._cfg.duration = 0.0
+                # SSB honesty (P2b-5): the symbol-aligned SSB view only exists
+                # on the 14·scs capture grid. When this message leaves the SSB
+                # backend at an incompatible rate (selecting SSB, changing the
+                # SCS, or picking an off-grid rate), retune to the nearest
+                # compatible rate and REPORT it — never a phantom SSB. Runs
+                # before the duration→rows derivation so rows follow the new
+                # rate/geometry.
+                if self._cfg.backend == "ssb" and not ssb_grid_compatible(
+                        self._cfg.sample_rate, self._cfg.ssb_subcarrier_spacing):
+                    new_rate = ssb_compatible_rate(
+                        self._cfg.sample_rate, self._cfg.ssb_subcarrier_spacing
+                    )
+                    if new_rate and new_rate != self._cfg.sample_rate:
+                        rounded.append({
+                            "field": "sample_rate",
+                            "requested": float(self._cfg.sample_rate),
+                            "used": float(new_rate),
+                            "reason": "SSB needs 2·sample_rate/subcarrier_spacing "
+                                      "to be a multiple of 28 (striqt symbol "
+                                      "grid); retuned the capture rate",
+                        })
+                        changes.append(("sample_rate", self._cfg.sample_rate, new_rate))
+                        self._cfg.sample_rate = float(new_rate)
+                if self._cfg.duration > 0:
+                    rows_new = int(max(1, min(
+                        round(self._cfg.duration * self._cfg.sample_rate / row_hop(self._cfg)),
+                        max_live_rows(self._cfg),
+                    )))
+                    if rows_new != self._cfg.rows:
+                        changes.append(("rows", self._cfg.rows, rows_new))
+                        self._cfg.rows = rows_new
+                # A new overlap/nfft/backend changes the per-row hop, which can
+                # push samples_needed(rows) past what the ring can supply — the
+                # Computer's avail >= need gate would then never pass and the
+                # display would starve. Re-clamp rows against the new hop.
+                max_rows = max_live_rows(self._cfg)
+                if self._cfg.rows > max_rows:
+                    old_rows = self._cfg.rows
+                    self._cfg.rows = max_rows
+                    changes.append(("rows", old_rows, max_rows))
                 self._dirty = True
         # Print outside the lock to avoid I/O inside a mutex
         for key, old, value in changes:
             print(f"[config] {key}: {old} -> {value}")
-        return {"applied": [k for k, _, _ in changes], "ignored": ignored, "reconnect": reconnect}
+        for entry in rounded:
+            print(f"[config] rounded {entry['field']}: "
+                  f"{entry['requested']} -> {entry['used']} ({entry['reason']})")
+        for entry in rejected:
+            print(f"[config] rejected {entry['field']}: {entry['reason']}")
+        return {
+            "applied":   [k for k, _, _ in changes],
+            "ignored":   ignored,
+            "reconnect": reconnect,
+            "rounded":   rounded,
+            "rejected":  rejected,
+        }
 
     def take_dirty(self):
         with self._lock:
@@ -642,16 +1812,24 @@ def make_source():
     return Airstack1Source.from_spec(source_spec)
 
 def make_capture(cfg):
+    # port stays fixed at CHANNELS — the two-waterfall UI depends on both RX ports
+    # (P1-2). The other four knobs are now driven by the schema editor / cfg.
+    # When cfg.duration owns the time axis (P2a-4) it drives the armed capture
+    # duration honestly; snapped to an integer sample count because striqt's
+    # Capture validation requires duration·sample_rate to be an integer.
+    duration = cfg.duration if cfg.duration > 0 else cfg.rows * cfg.nfft / cfg.sample_rate
+    duration = max(duration, 1e-3)
+    duration = round(duration * cfg.sample_rate) / cfg.sample_rate
     return specs.SoapyCapture(
         port=CHANNELS,
         center_frequency=cfg.center,
         gain=tuple([cfg.gain] * len(CHANNELS)),
-        duration=max(cfg.rows * cfg.nfft / cfg.sample_rate, 1e-3),
+        duration=duration,
         sample_rate=cfg.sample_rate,
-        backend_sample_rate=cfg.sample_rate,
-        host_resample=False,
-        analysis_bandwidth=float("inf"),
-        lo_shift="none",
+        backend_sample_rate=(cfg.backend_sample_rate or cfg.sample_rate),
+        host_resample=cfg.host_resample,
+        analysis_bandwidth=cfg.analysis_bandwidth,
+        lo_shift=cfg.lo_shift,
     )
 
 
@@ -678,110 +1856,292 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     # Normalize by window power (proper PSD estimate)
     power  = (np.abs(spec) ** 2) / max(float(np.sum(window ** 2)), 1.0)
     spg = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
-    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging.
-    return spg, {"fft_nfft": int(nfft), "bin_avg": 1}
+    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging,
+    # non-overlapping rows (hop = nfft).
+    return spg, {"fft_nfft": int(nfft), "bin_avg": 1, "hop_size": int(nfft)}
 
 
-def calibrated_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
-) -> tuple:
+def analysis_hop(nfft: int, fractional_overlap=DEFAULT_FRACTIONAL_OVERLAP) -> int:
     """
-    striqt-calibrated PSD spectrogram with symbol-style overlap/fill and
-    frequency-bin averaging. Returns (blocks, meta) — blocks (channels, rows,
-    bins) float32, meta {fft_nfft, bin_avg}.
+    Samples the STFT advances per displayed row: nfft − noverlap, where noverlap
+    is computed exactly as striqt does (`round(fractional_overlap * nfft)` on the
+    Fraction). At the default 13/28 overlap this is the familiar nfft·15/28.
+    """
+    nfft = int(nfft)
+    noverlap = round(Fraction(fractional_overlap) * nfft)
+    return max(1, nfft - int(noverlap))
+
+
+def resolve_integration_bandwidth(value, nfft: int, sample_rate: float):
+    """
+    Map the cfg integration_bandwidth ("auto" | None | Hz) to the value striqt
+    receives. "auto" reproduces the pre-P2a behaviour: frequency_resolution ×
+    averaging_factor(nfft), the only choice that tracks nfft changes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (sample_rate / float(nfft)) * averaging_factor(nfft)   # "auto"
+    return float(value)
+
+
+def make_analysis_spec(cfg: "RadioConfig", nfft: int, sample_rate: float):
+    """Build the striqt Spectrogram spec from cfg's analysis params (P2a-1)."""
+    frequency_resolution = float(sample_rate) / float(nfft)
+    integration = resolve_integration_bandwidth(
+        cfg.integration_bandwidth, nfft, sample_rate
+    )
+    lo = cfg.lo_bandstop
+    aperture = cfg.time_aperture
+    return analysis_specs.Spectrogram(
+        window=cfg.window,
+        frequency_resolution=frequency_resolution,
+        fractional_overlap=Fraction(cfg.fractional_overlap),
+        window_fill=Fraction(cfg.window_fill),
+        integration_bandwidth=integration,
+        trim_stopband=bool(cfg.trim_stopband),
+        lo_bandstop=(float(lo) if lo else None),
+        time_aperture=(float(aperture) if aperture else None),
+    )
+
+
+def time_aperture_bins(cfg: "RadioConfig", hop: int) -> int:
+    """STFT rows striqt averages into one output row for cfg.time_aperture
+    (1 = no time averaging). Mirrors striqt's round(time_aperture/hop_period)."""
+    if not cfg.time_aperture:
+        return 1
+    return max(1, round(float(cfg.time_aperture) * float(cfg.sample_rate) / max(1, hop)))
+
+
+def calibrated_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+    """
+    striqt-calibrated PSD spectrogram driven by cfg's analysis params (P2a-1) —
+    window, overlap, fill, integration bandwidth, LO bandstop, stopband trim.
+    Returns (blocks, meta) — blocks (channels, rows, bins) float32, meta
+    {fft_nfft, bin_avg, hop_size, freqs_hz_f0, freqs_hz_step}.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
-    nfft = aligned_nfft(nfft)
-    # Right-size to exactly `rows` STFT rows under the 13/28 overlap, rather than
-    # computing ~1.87×rows rows and discarding all but the last `rows` (LV-W2).
-    needed  = calibrated_sample_count(nfft, rows)
+    rows        = int(cfg.rows)
+    sample_rate = float(cfg.sample_rate)
+    nfft        = aligned_nfft(cfg.nfft)
+    hop         = analysis_hop(nfft, cfg.fractional_overlap)
+    # Right-size to exactly `rows` STFT rows under the configured overlap, rather
+    # than computing extra rows and discarding all but the last `rows` (LV-W2).
+    needed = calibrated_sample_count(nfft, rows, hop)
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
         samples = np.concatenate([samples, pad], axis=1)
     else:
         samples = samples[:, -needed:]
 
-    sample_rate = float(sample_rate)
+    # Carry the real analysis_bandwidth so trim_stopband=True has something to
+    # trim to; with the default trim=False / bandwidth=inf this is inert.
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
         duration=needed / sample_rate,
-        analysis_bandwidth=float("inf"),
+        analysis_bandwidth=float(cfg.analysis_bandwidth),
     )
-    frequency_resolution = sample_rate / float(nfft)
-    average_bins = averaging_factor(nfft)
-    spec = analysis_specs.Spectrogram(
-        window=("kaiser", 11.88),
-        frequency_resolution=frequency_resolution,
-        fractional_overlap=Fraction(13, 28),
-        window_fill=Fraction(15, 28),
-        integration_bandwidth=frequency_resolution * average_bins,
-        trim_stopband=False,
-        lo_bandstop=SSB_LO_BANDSTOP,
+    spec = make_analysis_spec(cfg, nfft, sample_rate)
+    integration = resolve_integration_bandwidth(
+        cfg.integration_bandwidth, nfft, sample_rate
+    )
+    average_bins = (
+        1 if integration is None
+        else max(1, round(integration / (sample_rate / nfft)))
     )
     striqt_shared.spectrogram_cache.clear()
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
+    # time_aperture averages time_bins STFT rows into one output row (P2b-2):
+    # fewer rows come back, and each spans time_bins hops of signal. Fit to the
+    # honest averaged count and disclose the widened hop so the client's time
+    # labels stay exact.
+    time_bins = time_aperture_bins(cfg, hop)
+    rows_out  = max(1, rows // time_bins) if time_bins > 1 else rows
     blocks = fit_display_rows(
-        np.asarray(spg, dtype=np.float32), rows,
-        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate, lo_null=lo_null,
+        np.asarray(spg, dtype=np.float32), rows_out,
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
+        lo_null=cfg.lo_null, lo_bandstop=cfg.lo_bandstop,
     )
-    return blocks, {"fft_nfft": int(nfft), "bin_avg": int(average_bins)}
+    meta = {"fft_nfft": int(nfft), "bin_avg": int(average_bins),
+            "hop_size": int(hop * time_bins)}
+    # Ship striqt's own frequency coordinates so the header axis is exact for ANY
+    # analysis params (trim/averaging change the bin grid in ways the header's
+    # symmetric-about-DC fallback can only approximate). Additive: build_header
+    # uses these when present, keeping the LV-F1 axis contract.
+    try:
+        freqs = striqt_shared.spectrogram_freqs(capture, spec)
+        freqs = np.asarray(freqs, dtype=np.float64)
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass   # fall back to build_header's symmetric axis
+    return blocks, meta
 
 
-def ssb_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
-) -> tuple:
+def make_psd_kwargs(cfg: "RadioConfig", nfft: int, sample_rate: float) -> dict:
+    """Keyword arguments for striqt's power_spectral_density from cfg's PSD
+    param block (P2b-3) — the exact spec the live compute and the tier-2
+    scratch validator both use."""
+    integration = resolve_integration_bandwidth(
+        cfg.psd_integration_bandwidth, nfft, sample_rate
+    )
+    lo = cfg.psd_lo_bandstop
+    return dict(
+        window=cfg.psd_window,
+        frequency_resolution=float(sample_rate) / float(nfft),
+        fractional_overlap=Fraction(cfg.psd_fractional_overlap),
+        window_fill=Fraction(cfg.psd_window_fill),
+        integration_bandwidth=integration,
+        trim_stopband=bool(cfg.psd_trim_stopband),
+        lo_bandstop=(float(lo) if lo else None),
+        time_statistic=tuple(cfg.psd_time_statistic),
+    )
+
+
+def psd_traces(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
     """
-    5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
-    are flattened to the dashboard's existing rows x bins frame contract.
+    striqt power_spectral_density backend (P2b-3): Welch-method statistic
+    traces over the frame's time span, one row per configured time_statistic
+    entry. Returns (blocks, meta) — blocks (channels, n_statistics, bins)
+    float32 dB; meta discloses the statistic list (psd_stats) and the true
+    integrated span (time_span_ms) alongside the usual axis params.
+    """
+    if not _ANALYSIS_OK:
+        raise RuntimeError(f"PSD backend unavailable: {_ANALYSIS_ERR!r}")
+
+    samples = np.asarray(samples, dtype=np.complex64)
+    rows        = int(cfg.rows)
+    sample_rate = float(cfg.sample_rate)
+    nfft        = aligned_nfft(cfg.nfft)
+    hop         = analysis_hop(nfft, cfg.psd_fractional_overlap)
+    needed      = calibrated_sample_count(nfft, rows, hop)
+    if samples.shape[1] < needed:
+        pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
+        samples = np.concatenate([samples, pad], axis=1)
+    else:
+        samples = samples[:, -needed:]
+
+    capture = analysis_specs.Capture(
+        sample_rate=sample_rate,
+        duration=needed / sample_rate,
+        analysis_bandwidth=float(cfg.analysis_bandwidth),
+    )
+    kwargs = make_psd_kwargs(cfg, nfft, sample_rate)
+    integration = kwargs["integration_bandwidth"]
+    average_bins = (
+        1 if integration is None
+        else max(1, round(integration / (sample_rate / nfft)))
+    )
+    psd, _ = striqt_measurements.power_spectral_density(
+        samples, capture, as_xarray=False, **kwargs
+    )
+    psd = np.asarray(psd, dtype=np.float32)   # (channels, n_stats, bins), dB
+    blocks = fit_display_rows(
+        psd, psd.shape[1],
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate,
+        lo_null=cfg.lo_null, lo_bandstop=cfg.psd_lo_bandstop,
+    )
+    meta = {
+        "fft_nfft": int(nfft), "bin_avg": int(average_bins), "hop_size": int(hop),
+        "psd_stats": [str(s) for s in cfg.psd_time_statistic],
+        "time_span_ms": 1e3 * needed / sample_rate,
+    }
+    # Exact striqt frequency coordinates, same contract as the calibrated path.
+    try:
+        spg_kwargs = {k: v for k, v in kwargs.items() if k != "time_statistic"}
+        spg_spec = analysis_specs.Spectrogram(**spg_kwargs)
+        freqs = np.asarray(striqt_shared.spectrogram_freqs(capture, spg_spec),
+                           dtype=np.float64)
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass   # fall back to build_header's symmetric axis
+    return blocks, meta
+
+
+def ssb_spectrogram(samples: np.ndarray, cfg: "RadioConfig") -> tuple:
+    """
+    True symbol-aligned 5G SSB spectrogram (P2b-5): striqt's
+    cellular_5g_ssb_spectrogram driven by cfg's SSB param block, one row per
+    OFDM symbol of each burst set, flattened (blocks·symbols) to the dashboard
+    row contract. Only reachable on the SSB grid (compute_blocks pre-checks
+    and runs calibrated honestly otherwise); grid errors here propagate to the
+    tier-3 backstop rather than silently substituting another analysis.
     Returns (blocks, meta).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
-    nfft = aligned_nfft(nfft)
-    sample_rate = float(sample_rate)
+    sample_rate = float(cfg.sample_rate)
+    geo = ssb_geometry(cfg)   # raises off-grid — backstop-visible, never phantom
+
+    # Trim to whole burst sets: striqt keeps the first symbol_rows of every
+    # discovery period, and its blockwise reshape needs the kept row count to
+    # be an exact multiple of symbol_rows.
+    q = 1 + max(0, (samples.shape[1] - ssb_block_samples(geo, 1))
+                // (geo["discovery_rows"] * geo["hop"]))
+    q = min(q, ssb_max_blocks(cfg, geo))
+    needed = ssb_block_samples(geo, q)
+    if samples.shape[1] < needed:
+        pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
+        samples = np.concatenate([samples, pad], axis=1)
+    else:
+        samples = samples[:, -needed:]
+
     capture = analysis_specs.Capture(
         sample_rate=sample_rate,
-        duration=samples.shape[1] / sample_rate,
+        duration=needed / sample_rate,
         analysis_bandwidth=float("inf"),
     )
-    try:
-        spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
-            samples,
-            capture,
-            as_xarray=False,
-            subcarrier_spacing=SSB_SUBCARRIER_SPACING,
-            sample_rate=min(SSB_SAMPLE_RATE, sample_rate),
-            discovery_periodicity=SSB_DISCOVERY_PERIOD,
-            frequency_offset=0.0,
-            max_block_count=None,
-            window="blackmanharris",
-            lo_bandstop=SSB_LO_BANDSTOP,
-        )
-    except ValueError as exc:
-        if "counting-number" not in str(exc):
-            raise
-        # The live viewer's power-of-two sample-rate/FFT controls are not
-        # always compatible with the strict 30 kHz SSB grid. Keep the selector
-        # useful by falling back to the same 13/28, 15/28 averaged grid.
-        return calibrated_spectrogram(samples, nfft, rows, sample_rate, lo_null=lo_null)
+    kwargs = make_ssb_kwargs(cfg)
+    spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
+        samples, capture, as_xarray=False, **kwargs
+    )
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
-    # Real SSB uses 15 kHz (subcarrier_spacing/2) resolution; best-effort axis
-    # params (this path is unreachable at the selectable sample rates — LV-F2).
-    ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
+
+    # Axis disclosure: the STFT runs nfft = 2·fs/scs at scs/2 resolution and
+    # integrates pairs of bins (integration_bandwidth = scs), so bin_avg = 2.
+    # The display-side LO null assumes DC sits at the band center, which only
+    # holds at zero frequency_offset — striqt's own lo_bandstop (NaN-nulled,
+    # then scrubbed) covers the true LO region in the offset case.
     blocks = fit_display_rows(
-        spg, rows,
-        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate, lo_null=lo_null,
+        spg, spg.shape[1],
+        bin_avg=2, fft_nfft=geo["nfft"], sample_rate=sample_rate,
+        lo_null=(cfg.lo_null and not cfg.ssb_frequency_offset),
+        lo_bandstop=cfg.ssb_lo_bandstop,
     )
-    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1}
+    # One display row = one OFDM symbol (hop samples). Rows across burst-set
+    # boundaries jump a discovery period — the view is a burst montage, so the
+    # hop labels the signal time actually shown.
+    meta = {"fft_nfft": int(geo["nfft"]), "bin_avg": 2, "hop_size": int(geo["hop"])}
+    # Exact striqt frequency coordinates for the truncated, offset SSB band.
+    # The coordinate factory lives in a private module whose path may differ in
+    # the installed striqt build — fall back to the symmetric header axis then.
+    try:
+        from striqt.analysis.measurements import (
+            _cellular_5g_ssb_spectrogram as _ssb_mod,
+        )
+        spec_obj = analysis_specs.Cellular5GNRSSBSpectrogram(**kwargs)
+        freqs = np.asarray(
+            _ssb_mod.cellular_ssb_baseband_frequency(capture, spec_obj),
+            dtype=np.float64,
+        )
+        if freqs.size >= 2:
+            meta["freqs_hz_f0"]   = float(freqs[0])
+            meta["freqs_hz_step"] = float(freqs[1] - freqs[0])
+    except Exception:
+        pass
+    return blocks, meta
 
 
 # Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
@@ -803,18 +2163,69 @@ def averaging_factor(nfft: int) -> int:
     return 1
 
 
-def calibrated_sample_count(nfft: int, rows: int) -> int:
+def calibrated_sample_count(nfft: int, rows: int, hop=None) -> int:
     """
-    Samples needed to produce exactly `rows` STFT rows under the 13/28 overlap.
-    Each displayed row advances the STFT by hop = nfft·15/28 samples, so
-    rows·hop + (nfft-hop) samples suffice — instead of the ~1.87× that rows·nfft
-    would compute and then discard (see AUDIT_REPORT.md LV-W2). `nfft` must be an
-    aligned FFT size (multiple of 28) so the hop divides evenly; the count then
-    reproduces striqt's own row formula int((nfft/hop)·(N/nfft-1)+1) == rows.
+    Samples needed to produce exactly `rows` STFT rows under the configured
+    overlap. Each displayed row advances the STFT by `hop` samples (nfft·15/28 at
+    the default 13/28 overlap), so rows·hop + (nfft-hop) samples suffice — instead
+    of the ~1.87× that rows·nfft would compute and then discard (see
+    AUDIT_REPORT.md LV-W2). The count reproduces striqt's own row formula
+    int((nfft/hop)·(N/nfft-1)+1) == rows for any hop that divides its terms.
     """
     nfft = int(nfft)
-    hop = (nfft * 15) // 28
+    if hop is None:
+        hop = (nfft * 15) // 28
+    hop = max(1, int(hop))
     return int(rows * hop + (nfft - hop))
+
+
+def backend_overlap(cfg: RadioConfig):
+    """The fractional_overlap the executing backend's STFT uses (P2b-3): the
+    PSD backend runs its own param block; calibrated/ssb share the spectrogram
+    block."""
+    return cfg.psd_fractional_overlap if cfg.backend == "psd" else cfg.fractional_overlap
+
+
+def row_hop(cfg: RadioConfig) -> int:
+    """Samples of signal one display row spans for cfg's backend (P2a-1). For
+    the PSD backend a "row" is one STFT row feeding the statistics, so the
+    duration→rows mapping controls the integrated time span (P2b-3). For the
+    SSB view, symbol_rows display rows come from every discovery period, so
+    the duration→rows mapping picks the burst count (P2b-5)."""
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        geo = ssb_geometry(cfg)
+        return max(1, round(geo["discovery_rows"] * geo["hop"] / geo["symbol_rows"]))
+    if cfg.backend in CALIBRATED_GRID_BACKENDS:
+        nfft = aligned_nfft(cfg.nfft)
+        return analysis_hop(nfft, backend_overlap(cfg))
+    return max(1, int(cfg.nfft))
+
+
+def max_live_rows(cfg: RadioConfig) -> int:
+    """
+    Largest number of display rows the IQ ring can actually supply for `cfg`'s
+    backend and FFT size (P1-5). Replaces the old flat 300-row clamp, which pinned
+    every long duration to 300 rows and made the Duration control inert past
+    ~10-20 ms. The bound is honest, not cosmetic: `samples_needed(rows)` must stay
+    within `RING_ROW_FILL·MAX_TAIL` so the Computer's `avail >= need` gate is
+    reached promptly (otherwise a too-large request would starve the display), and
+    never exceed the absolute `MAX_ROWS_ABS` ceiling. A longer duration therefore
+    renders more rows (and, on the calibrated path, costs more FFTs → fps may fall,
+    which is expected and left honest — the cap protects the radio, not the fps).
+    """
+    limit = int(MAX_TAIL * RING_ROW_FILL)
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        geo = ssb_geometry(cfg)
+        rows = ssb_max_blocks(cfg, geo) * geo["symbol_rows"]
+    elif cfg.backend in CALIBRATED_GRID_BACKENDS:
+        nfft = aligned_nfft(cfg.nfft)
+        hop  = analysis_hop(nfft, backend_overlap(cfg))
+        rows = (limit - (nfft - hop)) // hop
+    else:
+        rows = limit // max(1, int(cfg.nfft))
+    return int(max(1, min(rows, MAX_ROWS_ABS)))
 
 
 def fit_display_rows(
@@ -825,6 +2236,7 @@ def fit_display_rows(
     fft_nfft=None,
     sample_rate=None,
     lo_null: bool = True,
+    lo_bandstop=SSB_LO_BANDSTOP,
 ) -> np.ndarray:
     """Crop/pad a striqt spectrogram to the dashboard row contract."""
     spg = np.asarray(spg, dtype=np.float32)
@@ -841,12 +2253,14 @@ def fit_display_rows(
             )
             spg = np.concatenate([pad, spg], axis=1)
 
-    # Null the LO leakage region, sized to the striqt bandstop instead of a fixed
-    # ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse FFTs). Optional
-    # via the lo_null flag so the center can be revealed (LV-F8).
-    if lo_null and spg.shape[2] >= 3 and fft_nfft and sample_rate:
+    # Null the LO leakage region, sized to the configured striqt bandstop instead
+    # of a fixed ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse
+    # FFTs). Optional via the lo_null flag so the center can be revealed (LV-F8).
+    # With lo_bandstop None ("none" in the Analysis panel) there is no bandstop to
+    # size, so the display null is skipped too — the raw DC leak shows, honestly.
+    if lo_null and lo_bandstop and spg.shape[2] >= 3 and fft_nfft and sample_rate:
         step = max(1, bin_avg) * float(sample_rate) / float(fft_nfft)   # Hz per averaged bin
-        half = max(1, math.ceil((SSB_LO_BANDSTOP / 2) / step))
+        half = max(1, math.ceil((float(lo_bandstop) / 2) / step))
         c = spg.shape[-1] // 2
         lo = max(0, c - half)
         hi = min(spg.shape[-1], c + half + 1)
@@ -862,21 +2276,129 @@ def fit_display_rows(
 
 
 def samples_needed(cfg: RadioConfig) -> int:
-    if cfg.backend in {"calibrated", "ssb"}:
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate,
+                                                    cfg.ssb_subcarrier_spacing):
+        # Whole burst sets only (P2b-5): striqt keeps symbol_rows rows per
+        # discovery period and reshapes blockwise, so the supplied span must
+        # end exactly at a burst boundary. cfg.rows (duration-derived at
+        # discovery_periodicity/symbol_rows per row) picks the burst count.
+        geo = ssb_geometry(cfg)
+        q = max(1, round(cfg.rows / geo["symbol_rows"]))
+        q = min(q, ssb_max_blocks(cfg, geo))
+        return ssb_block_samples(geo, q)
+    if cfg.backend in CALIBRATED_GRID_BACKENDS:
         # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
         # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
-        base = calibrated_sample_count(aligned_nfft(cfg.nfft), cfg.rows)
-    else:
-        base = int(cfg.nfft * cfg.rows)
-    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
-        ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
-        return max(base, ssb)
-    return base
+        nfft = aligned_nfft(cfg.nfft)
+        return calibrated_sample_count(
+            nfft, cfg.rows, analysis_hop(nfft, backend_overlap(cfg))
+        )
+    return int(cfg.nfft * cfg.rows)
 
 
-def ssb_grid_compatible(sample_rate: float) -> bool:
-    nfft = round(2 * float(sample_rate) / SSB_SUBCARRIER_SPACING)
-    return nfft > 0 and (13 * nfft) % 28 == 0
+def ssb_grid_compatible(sample_rate: float,
+                        subcarrier_spacing: float = SSB_SUBCARRIER_SPACING) -> bool:
+    """
+    True when the capture rate supports the symbol-aligned SSB view at this
+    subcarrier spacing: the SSB spectrogram runs at frequency_resolution scs/2
+    with window_fill 15/28, so nfft = 2·fs/scs must be an integer AND a
+    multiple of 28 ((1-15/28)·nfft integrality — the audit's "30 kHz grid").
+    Equivalently: fs must be a multiple of 14·scs.
+    """
+    ratio = 2.0 * float(sample_rate) / float(subcarrier_spacing)
+    nfft = round(ratio)
+    return nfft >= 28 and abs(ratio - nfft) < 1e-6 and nfft % 28 == 0
+
+
+def ssb_compatible_rate(sample_rate: float, subcarrier_spacing: float):
+    """
+    Nearest capture sample rate that satisfies the SSB grid for this
+    subcarrier spacing — the retune target when the SSB view is selected at an
+    incompatible rate (P2b-5). Candidates are multiples of 14·scs, preferring
+    those also on the radio's 1.92 MHz LTE-family grid (most plausibly armable
+    — e.g. 13.44 MS/s = 7·1.92 MHz for all standard SCS), clamped to
+    SSB_MAX_RATE. Returns None when no such rate exists (scs too large).
+    """
+    base = 14.0 * float(subcarrier_spacing)
+    if not (base > 0 and math.isfinite(base)) or base > SSB_MAX_RATE:
+        return None
+    step = base
+    if abs(base - round(base)) < 1e-6:
+        g = math.gcd(int(round(base)), 1920000)
+        lcm = int(round(base)) * (1920000 // g)
+        if lcm <= SSB_MAX_RATE:
+            step = float(lcm)
+    k = max(1, round(float(sample_rate) / step))
+    while k > 1 and k * step > SSB_MAX_RATE:
+        k -= 1
+    rate = k * step
+    return float(rate) if rate <= SSB_MAX_RATE else None
+
+
+def make_ssb_kwargs(cfg: "RadioConfig") -> dict:
+    """Keyword arguments for striqt's cellular_5g_ssb_spectrogram from cfg's
+    SSB param block (P2b-5) — shared by the live compute and the tier-2
+    scratch validator."""
+    return dict(
+        subcarrier_spacing=float(cfg.ssb_subcarrier_spacing),
+        # striqt truncates the frequency axis to this output rate; it can never
+        # exceed the sampled span.
+        sample_rate=min(float(cfg.ssb_sample_rate), float(cfg.sample_rate)),
+        discovery_periodicity=float(cfg.ssb_discovery_periodicity),
+        frequency_offset=float(cfg.ssb_frequency_offset),
+        max_block_count=(int(cfg.ssb_max_block_count)
+                         if cfg.ssb_max_block_count else None),
+        window=cfg.ssb_window,
+        lo_bandstop=(float(cfg.ssb_lo_bandstop) if cfg.ssb_lo_bandstop else None),
+    )
+
+
+def ssb_geometry(cfg: "RadioConfig", sample_rate=None) -> dict:
+    """
+    Row/sample geometry of the symbol-aligned SSB spectrogram (P2b-5). striqt
+    runs the STFT at frequency_resolution scs/2 with a 13/28 overlap, making
+    one row per OFDM symbol; each discovery period contributes the first
+    `symbol_rows` symbols (one burst set, always 2 ms of signal).
+      nfft:           STFT size 2·fs/scs
+      hop:            samples per symbol row (nfft·15/28)
+      symbol_rows:    rows kept per burst set (28·scs/15e3)
+      discovery_rows: rows spanning one discovery period
+    Raises ValueError when the rate/scs combination is off the grid.
+    """
+    fs  = float(sample_rate if sample_rate is not None else cfg.sample_rate)
+    scs = float(cfg.ssb_subcarrier_spacing)
+    if not ssb_grid_compatible(fs, scs):
+        raise ValueError(
+            f"sample rate {fs/1e6:g} MS/s is not on the SSB grid for "
+            f"subcarrier spacing {scs/1e3:g} kHz (2·fs/scs must be a 28-multiple)"
+        )
+    nfft = round(2.0 * fs / scs)
+    hop  = (nfft * 15) // 28
+    symbol_rows = max(1, round(28.0 * scs / 15e3))
+    discovery_rows = max(symbol_rows,
+                         round(float(cfg.ssb_discovery_periodicity) * fs / hop))
+    return {"nfft": nfft, "hop": hop,
+            "symbol_rows": symbol_rows, "discovery_rows": discovery_rows}
+
+
+def ssb_block_samples(geo: dict, blocks: int) -> int:
+    """Samples that yield exactly `blocks` complete burst sets: (q-1) full
+    discovery periods plus the final burst's symbol rows, plus STFT tail."""
+    q = max(1, int(blocks))
+    return int((q - 1) * geo["discovery_rows"] * geo["hop"]
+               + geo["symbol_rows"] * geo["hop"]
+               + (geo["nfft"] - geo["hop"]))
+
+
+def ssb_max_blocks(cfg: "RadioConfig", geo: dict) -> int:
+    """Most burst sets one frame can hold: bounded by the ring (same
+    RING_ROW_FILL budget as max_live_rows) and cfg.ssb_max_block_count."""
+    limit = int(MAX_TAIL * RING_ROW_FILL)
+    per_extra = geo["discovery_rows"] * geo["hop"]
+    q = 1 + max(0, (limit - ssb_block_samples(geo, 1)) // max(1, per_extra))
+    if cfg.ssb_max_block_count:
+        q = min(q, max(1, int(cfg.ssb_max_block_count)))
+    return int(max(1, q))
 
 
 def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
@@ -887,17 +2409,22 @@ def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     used by build_header to ship an honest frame header (LV-F1/F2).
     """
     requested = cfg.backend
-    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate):
-        # SSB requires a sample rate on the 420 kHz grid; none of the selectable
-        # rates qualify, so skip the striqt call (which would raise and fall back
-        # every frame) and run calibrated directly, reporting it honestly (LV-F2).
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate,
+                                                      cfg.ssb_subcarrier_spacing):
+        # SSB needs the capture rate on the 14·scs grid. Selecting SSB retunes
+        # to a compatible rate (P2b-5), so this only covers the transient (or a
+        # rate the retune could not reach): run calibrated and REPORT it via
+        # backend/backend_requested — never a phantom SSB view (LV-F2).
+        blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
     elif requested == "calibrated":
-        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        blocks, meta = calibrated_spectrogram(samples, cfg)
         executed = "calibrated"
+    elif requested == "psd":
+        blocks, meta = psd_traces(samples, cfg)
+        executed = "psd"
     elif requested == "ssb":
-        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        blocks, meta = ssb_spectrogram(samples, cfg)
         executed = "ssb"
     else:
         blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
@@ -921,14 +2448,20 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
     fft_nfft = int(meta.get("fft_nfft", bins)) or int(bins)
     bin_avg  = int(meta.get("bin_avg", 1)) or 1
 
-    # Frequency axis. Quicklook is a plain fftshifted FFT (bin 0 = -fs/2); the
-    # calibrated/ssb path DC-centers bin_avg-wide averaged groups, so their
-    # centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
-    step = bin_avg * fs / fft_nfft
-    if executed == "quicklook":
-        f0 = -fs / 2.0
+    # Frequency axis. Prefer the exact coordinates striqt computed for the
+    # executed spec (calibrated path, P2a-1) — correct for any overlap/averaging/
+    # trim combination. Fallback: quicklook is a plain fftshifted FFT (bin 0 =
+    # -fs/2); the calibrated/ssb path DC-centers bin_avg-wide averaged groups, so
+    # their centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
+    if meta.get("freqs_hz_f0") is not None and meta.get("freqs_hz_step") is not None:
+        f0   = float(meta["freqs_hz_f0"])
+        step = float(meta["freqs_hz_step"])
     else:
-        f0 = -(bins - 1) / 2.0 * step
+        step = bin_avg * fs / fft_nfft
+        if executed == "quicklook":
+            f0 = -fs / 2.0
+        else:
+            f0 = -(bins - 1) / 2.0 * step
 
     header = {
         "center":        float(cfg.center),
@@ -943,8 +2476,19 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         "bin_avg":       bin_avg,
         "freqs_hz_f0":   float(f0),
         "freqs_hz_step": float(step),
+        # Samples of signal one display row spans (additive, P2a-1). Lets the
+        # client label the time axis exactly for any fractional_overlap instead
+        # of assuming the 15/28 hop.
+        "hop_size":      int(meta.get("hop_size", fft_nfft) or fft_nfft),
         "time":          time.time(),
     }
+    # PSD-backend extras (P2b-3, additive): the statistic behind each block row
+    # and the true integrated time span (block rows are statistics, not time,
+    # so the hop-based window label doesn't apply).
+    if meta.get("psd_stats") is not None:
+        header["psd_stats"] = list(meta["psd_stats"])
+    if meta.get("time_span_ms") is not None:
+        header["time_span_ms"] = float(meta["time_span_ms"])
     requested = str(meta.get("backend_requested", executed))
     if requested != executed:
         header["backend_requested"] = requested
@@ -1209,11 +2753,15 @@ class Computer(threading.Thread):
         super().__init__(daemon=True)
         self.acquirer = acquirer
         self.shared   = shared
+        self._last_err_notice = 0.0
 
     def run(self):
         interval = 1.0 / max(BROADCAST_FPS, 1.0)
         next_t   = time.time()
         while not self.shared.stopped():
+            # Serve any pending tier-2 validation probe first: this thread owns
+            # striqt's thread-bound persistent window cache (P2a-5).
+            self.shared.service_probe()
             cfg     = self.shared.snapshot()
             need    = samples_needed(cfg)
             g0      = self.acquirer.generation()
@@ -1235,8 +2783,22 @@ class Computer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                self.shared.note_good_analysis(cfg)
             except Exception as e:
+                # Backstop (P2a-3): even if a bad analysis param somehow reached
+                # the live compute, catch it, revert to the last-good analysis
+                # config, keep streaming, and surface the reason — the viewer
+                # must never freeze.
                 print(f"[compute] error: {e}")
+                reverted = self.shared.revert_analysis(str(e))
+                if reverted:
+                    print(f"[compute] reverted analysis params: {reverted}")
+                elif time.time() - self._last_err_notice > 5.0:
+                    # Not analysis-induced (nothing to revert) — tell the viewer
+                    # anyway, throttled so a persistent fault can't spam.
+                    self.shared.push_notice(f"compute error: {e}")
+                    self._last_err_notice = time.time()
+                time.sleep(0.1)
 
             # Pace to the broadcast rate; never busy-spin if compute outran it.
             next_t += interval
@@ -1279,12 +2841,16 @@ class DemoAcquirer(threading.Thread):
 
     def run(self):
         rng = np.random.default_rng(42)
+        last_err_notice = 0.0
         print("[demo] Synthetic IQ mode — no radio hardware used.")
         print("[demo] Two CW tones per channel + noise. Controls work normally.")
 
         interval = 1.0 / max(BROADCAST_FPS, 1.0)
         next_t = time.time()
         while not self.shared.stopped():
+            # This is the compute thread in demo mode — serve tier-2 probes here
+            # for the same thread-bound-cache reason as the Computer (P2a-5).
+            self.shared.service_probe()
             cfg = self.shared.snapshot()
             n   = samples_needed(cfg)
             t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
@@ -1309,8 +2875,17 @@ class DemoAcquirer(threading.Thread):
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
+                self.shared.note_good_analysis(cfg)
             except Exception as e:
+                # Same backstop as the hardware Computer (P2a-3): revert to the
+                # last-good analysis config and keep the demo stream alive.
                 print(f"[demo] compute error: {e}")
+                reverted = self.shared.revert_analysis(str(e))
+                if reverted:
+                    print(f"[demo] reverted analysis params: {reverted}")
+                elif time.time() - last_err_notice > 5.0:
+                    self.shared.push_notice(f"compute error: {e}")
+                    last_err_notice = time.time()
 
             next_t += interval
             dt = next_t - time.time()
@@ -1442,6 +3017,84 @@ async def schema_endpoint():
     return JSONResponse(capture_editor_schema())
 
 
+def current_config():
+    """
+    JSON view of the live RadioConfig (P2a-5). The browser seeds its forms from
+    this instead of the striqt schema defaults, so a bare Apply re-sends the
+    server's own values — no more silent flips of untouched fields whose schema
+    default differs from the server default (e.g. host_resample true vs false).
+    Also the re-sync source after every settings/analysis ack.
+    """
+    cfg = _shared.snapshot()
+    # The analysis pipelines always execute on the aligned 28-multiple grid, so
+    # the resolutions reported for their blocks use it regardless of backend.
+    nfft_exec = aligned_nfft(cfg.nfft)
+    window = list(cfg.window) if isinstance(cfg.window, tuple) else cfg.window
+    integration = cfg.integration_bandwidth
+    if not (integration is None or isinstance(integration, str)):
+        integration = float(integration)
+    psd_window = (list(cfg.psd_window) if isinstance(cfg.psd_window, tuple)
+                  else cfg.psd_window)
+    psd_integration = cfg.psd_integration_bandwidth
+    if not (psd_integration is None or isinstance(psd_integration, str)):
+        psd_integration = float(psd_integration)
+    return _json_safe({
+        "capture": {
+            "center_frequency":    float(cfg.center),
+            "sample_rate":         float(cfg.sample_rate),
+            "gain":                float(cfg.gain),
+            "analysis_bandwidth":  float(cfg.analysis_bandwidth),
+            "lo_shift":            str(cfg.lo_shift),
+            "host_resample":       bool(cfg.host_resample),
+            "backend_sample_rate": float(cfg.backend_sample_rate),
+            "duration":            float(cfg.duration),
+            "nfft":                int(cfg.nfft),
+        },
+        "analysis": {
+            "window":                window,
+            "frequency_resolution":  float(cfg.sample_rate) / nfft_exec,
+            "fractional_overlap":    str(cfg.fractional_overlap),
+            "window_fill":           str(cfg.window_fill),
+            "integration_bandwidth": integration,
+            "lo_bandstop":           float(cfg.lo_bandstop) if cfg.lo_bandstop else None,
+            "trim_stopband":         bool(cfg.trim_stopband),
+            "time_aperture":         float(cfg.time_aperture) if cfg.time_aperture else None,
+        },
+        "analysis_psd": {
+            "window":                psd_window,
+            "frequency_resolution":  float(cfg.sample_rate) / nfft_exec,
+            "fractional_overlap":    str(cfg.psd_fractional_overlap),
+            "window_fill":           str(cfg.psd_window_fill),
+            "integration_bandwidth": psd_integration,
+            "lo_bandstop":           float(cfg.psd_lo_bandstop) if cfg.psd_lo_bandstop else None,
+            "trim_stopband":         bool(cfg.psd_trim_stopband),
+            "time_statistic":        [s if isinstance(s, str) else float(s)
+                                      for s in cfg.psd_time_statistic],
+        },
+        "analysis_ssb": {
+            "subcarrier_spacing":    float(cfg.ssb_subcarrier_spacing),
+            "sample_rate":           float(cfg.ssb_sample_rate),
+            "discovery_periodicity": float(cfg.ssb_discovery_periodicity),
+            "frequency_offset":      float(cfg.ssb_frequency_offset),
+            "max_block_count":       (int(cfg.ssb_max_block_count)
+                                      if cfg.ssb_max_block_count else None),
+            "window":                (list(cfg.ssb_window)
+                                      if isinstance(cfg.ssb_window, tuple)
+                                      else cfg.ssb_window),
+            "lo_bandstop":           (float(cfg.ssb_lo_bandstop)
+                                      if cfg.ssb_lo_bandstop else None),
+        },
+        "backend": str(cfg.backend),
+        "rows":    int(cfg.rows),
+        "lo_null": bool(cfg.lo_null),
+    })
+
+
+@app.get("/config")
+async def config_endpoint():
+    return JSONResponse(current_config())
+
+
 async def _broadcaster():
     """
     Polls acquirer.latest() at BROADCAST_FPS, serializes the frame once, and
@@ -1457,6 +3110,17 @@ async def _broadcaster():
 
         if not _connections:
             continue
+
+        # Flush queued server notices (compute-backstop reverts etc.) to every
+        # viewer — even on ticks with no new frame, so a stalled compute still
+        # reports its reason (P2a-3).
+        for notice in _shared.drain_notices():
+            text = json.dumps({"message": f"[server] {notice}"})
+            for ws in list(_connections):
+                try:
+                    await ws.send_text(text)
+                except Exception:
+                    pass   # dropped clients are pruned by the frame loop below
 
         # latest() is fast (threading.Lock + numpy copy) — no executor needed
         header, blocks = _acquirer.latest()
@@ -1545,13 +3209,37 @@ async def ws_endpoint(ws: WebSocket):
                 continue
             try:
                 ctrl = json.loads(text)
-                ack = _shared.update(ctrl)
-                # Acknowledge settings-editor applies so the UI can show what took
-                # effect vs what was ignored or needs a reconnect (LV-F6).
-                if isinstance(ctrl, dict) and ("capture" in ctrl or "source" in ctrl):
-                    await ws.send_text(json.dumps({"message":
-                        f"settings — applied {ack['applied']}; "
-                        f"ignored {ack['ignored']}; reconnect-only {ack['reconnect']}"}))
+                # Run in a worker thread: an analysis apply blocks on tier-2
+                # probes serviced by the compute thread (up to ~0.1 s per
+                # field), which must not stall the event loop / broadcaster.
+                ack = await asyncio.get_running_loop().run_in_executor(
+                    None, _shared.update, ctrl
+                )
+                # Acknowledge settings/analysis applies so the UI can show what
+                # took effect vs what was rounded, rejected, ignored, or needs a
+                # reconnect (LV-F6, P2a-2). The structured ack rides along so
+                # app.js can surface rounded/rejected in the status line.
+                # Also ack any message the freedom model adjusted (rounded/
+                # rejected) — e.g. a bare {"backend":"ssb"} that retuned the
+                # sample rate (P2b-5) must be reported, not just applied.
+                if isinstance(ctrl, dict) and (
+                    "capture" in ctrl or "source" in ctrl or "analysis" in ctrl
+                    or ack.get("rounded") or ack.get("rejected")
+                ):
+                    parts = [f"applied {ack['applied']}"]
+                    for r in ack.get("rounded", []):
+                        parts.append(
+                            f"rounded {r['field']}: {r['requested']} → {r['used']} ({r['reason']})"
+                        )
+                    for r in ack.get("rejected", []):
+                        parts.append(f"rejected {r['field']}: {r['reason']}")
+                    if ack.get("ignored"):
+                        parts.append(f"ignored {ack['ignored']}")
+                    if ack.get("reconnect"):
+                        parts.append(f"reconnect-only {ack['reconnect']}")
+                    await ws.send_text(json.dumps(
+                        {"message": "settings — " + "; ".join(parts), "ack": ack}
+                    ))
             except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
                 # A single malformed control message must never drop the (only)
                 # viewer connection (LV-R2).
@@ -1603,7 +3291,7 @@ def main():
                         help="Listen port")
     args = parser.parse_args()
 
-    if args.demo and not _ANALYSIS_OK and args.backend in {"calibrated", "ssb"}:
+    if args.demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")
         SPEC_BACKEND = "quicklook"
     else:
