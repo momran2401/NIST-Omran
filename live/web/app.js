@@ -33,14 +33,22 @@ let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
 let windowMs    = 20;
 let analysisMode = "spectrogram";
+let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
+let lastRender  = 0;        // performance.now() of the last rendered frame
 
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
 let curFs       = 15.36e6;
-let curNfft     = 1024;
+let radioNfft   = 1024;     // requested radio FFT size (from #nfft-sel); NEVER set from frame headers
+let curBins     = 1024;     // bins in the current frame's blocks (from header "nfft")
 let curRows     = 12;
 let curBackend  = "calibrated";
 let freqsMHz    = null;     // Float32Array(nfft)
+let curF0       = null;     // header freqs_hz_f0 (true axis origin, Hz baseband)
+let curStep     = null;     // header freqs_hz_step (true bin spacing, Hz)
+let curFftNfft  = 1024;     // header fft_nfft (real FFT size behind the bin count)
+let curBinAvg   = 1;        // header bin_avg (frequency-bin averaging factor)
+let lastBackendWarn = null; // dedups the "SSB unavailable" status warning
 let levels      = [-90, -10];
 
 // Per-channel display buffers [rows_displayed × nfft], newest row at index 0
@@ -96,37 +104,79 @@ function setStatus(text, cls = "") {
 }
 
 function updateMeta() {
-    if (!curNfft || !curFs) return;
-    const depthRows = wfBuf[0] ? wfBuf[0].length / curNfft : curRows;
-    const winMs     = (depthRows * curNfft / curFs * 1e3).toFixed(0);
+    if (!curBins || !curFs) return;
+    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const winMs     = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
-    const analysis  = analysisMode === "ssb" ? "SSB" : (analysisMode === "psd" ? "PSD" : curBackend);
+    const analysis  = curBackend;   // executed backend from the header (honest — LV-F2)
+    // FFT label discloses radio size → real FFT size (bins × averaging) for the
+    // calibrated/ssb averaged grid; plain radio size for the per-bin quicklook.
+    const fftLabel  = curBackend === "quicklook"
+        ? `${radioNfft}`
+        : `${radioNfft}→${curFftNfft} (${curBins} bins × ${curBinAvg})`;
     metaEl.textContent = (
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${curNfft} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
+        `FFT ${fftLabel} | ${analysis} | ${mode} | window ${winMs} ms (${depthRows} rows) | ` +
         `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
         `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
     );
+    renderWfAxis();
 }
 
 // ---------------------------------------------------------------------------
 // Frequency axis helpers
 // ---------------------------------------------------------------------------
 
-function buildFreqsMHz(center, fs, nfft, absoluteRF) {
+function buildFreqsMHz(center, fs, nfft, absoluteRF, f0, step) {
     const f = new Float32Array(nfft);
+    if (f0 != null && step != null) {
+        // Server-supplied true axis: correct for the calibrated DC-centered bin
+        // groups (which drop edge bins) as well as the quicklook per-bin FFT.
+        for (let i = 0; i < nfft; i++) {
+            const baseHz = f0 + i * step;
+            f[i] = absoluteRF ? (center + baseHz) / 1e6 : baseHz / 1e6;
+        }
+        return f;
+    }
     for (let i = 0; i < nfft; i++) {
-        // fftshifted: bin 0 = most-negative freq, bin nfft/2 = DC
+        // fftshifted fallback (old servers): bin 0 = most-negative, nfft/2 = DC
         const baseHz = ((i - nfft / 2) / nfft) * fs;
         f[i] = absoluteRF ? (center + baseHz) / 1e6 : baseHz / 1e6;
     }
     return f;
 }
 
-function rowsForWindow(fs, nfft, windowMs) {
-    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / nfft), 300));
+// Hop fraction of the radio FFT size between successive STFT rows. Quicklook
+// takes non-overlapping full-length FFTs (hop = nfft); the calibrated/ssb striqt
+// path uses window_fill = 15/28, so the hop is nfft·15/28 (finer time spacing).
+function backendHopFrac() {
+    return curBackend === "quicklook" ? 1 : 15 / 28;
+}
+
+// Rows the display window spans. windowMs of signal advances by (radioNfft·hopFrac)
+// samples per STFT row, so rows = windowMs·fs / (radioNfft·hopFrac). Uses the
+// requested radio FFT size, NOT the per-frame averaged bin count.
+function rowsForWindow(fs, radioNfft, windowMs, hopFrac) {
+    return Math.max(1, Math.min(Math.round(windowMs / 1000 * fs / (radioNfft * hopFrac)), 300));
+}
+
+// Mirror of the server's ssb_grid_compatible: the true SSB path needs the sample
+// rate on a 420 kHz grid (13·nfft divisible by 28, nfft = round(2·fs/30 kHz)).
+function ssbGridCompatible(fs) {
+    const nfft = Math.round(2 * fs / 30e3);
+    return nfft > 0 && (13 * nfft) % 28 === 0;
+}
+
+// Disable the SSB analysis option when the current rate can't deliver it, so the
+// UI never offers what the stack silently falls back from (LV-F2).
+function updateSsbOption() {
+    const opt = document.querySelector('#analysis-sel option[value="ssb"]');
+    if (!opt) return;
+    const ok = ssbGridCompatible(curFs);
+    opt.disabled = !ok;
+    opt.title = ok ? "" : "SSB needs a sample rate on the 420 kHz grid — none of the LTE rates qualify";
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +192,7 @@ function connect() {
         setStatus("connected", "ok");
         logMsg("WebSocket connected");
         // Tell the server our initial window size
-        sendControl({ rows: rowsForWindow(curFs, curNfft, windowMs) });
+        sendControl({ rows: rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac()) });
     };
 
     ws.onmessage = (e) => {
@@ -156,9 +206,20 @@ function connect() {
         if (!paused) onFrame(e.data);
     };
 
-    ws.onclose = () => {
-        setStatus("disconnected — reconnecting…", "warn");
-        logMsg("WebSocket disconnected; retrying in 1.2 s", "WARN");
+    ws.onclose = (event) => {
+        // Distinct close codes (LV-R3): 1008 = auth failed, 4001 = viewer slot busy.
+        if (event && event.code === 1008) {
+            setStatus("authentication failed — reload to log in", "error");
+            logMsg("WebSocket closed: authentication failed (1008)", "ERROR");
+            return;   // do NOT reconnect on an auth failure
+        }
+        if (event && event.code === 4001) {
+            setStatus("another viewer is connected — retrying…", "warn");
+            logMsg("Viewer slot busy (4001); retrying in 1.2 s", "WARN");
+        } else {
+            setStatus("disconnected — reconnecting…", "warn");
+            logMsg("WebSocket disconnected; retrying in 1.2 s", "WARN");
+        }
         setTimeout(connect, 1200);
     };
 
@@ -182,7 +243,15 @@ function onFrame(data) {
     const hdrText = new TextDecoder().decode(new Uint8Array(data, 4, hdrLen));
     const header  = JSON.parse(hdrText);
 
-    const { nfft, rows, channels, center, fs, gain, dtype, scale, backend } = header;
+    // Throttle to Max fps: skip the block parse + render for frames arriving faster
+    // than 1000/maxFps. The header is already parsed; meta fps reflects the actual
+    // render rate since the fps counter runs only on rendered frames (LV-U1a).
+    const nowRender = performance.now();
+    if (nowRender - lastRender < 1000 / maxFps) return;
+    lastRender = nowRender;
+
+    const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
+            backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg } = header;
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -206,15 +275,37 @@ function onFrame(data) {
     }
 
     // ── Update state when tuning changes ──────────────────────────────────
+    const stepVal = (freqs_hz_step !== undefined && freqs_hz_step !== null) ? freqs_hz_step : null;
+    const f0Val   = (freqs_hz_f0   !== undefined && freqs_hz_f0   !== null) ? freqs_hz_f0   : null;
     const tuningChanged = (
-        nfft !== curNfft || center !== curCenter || fs !== curFs
+        nfft !== curBins || center !== curCenter || fs !== curFs || stepVal !== curStep
     );
     curBackend = backend || curBackend;
+    curFftNfft = (fft_nfft !== undefined && fft_nfft !== null) ? fft_nfft : nfft;
+    curBinAvg  = (bin_avg  !== undefined && bin_avg  !== null) ? bin_avg  : 1;
+
+    // Honest backend reporting: warn once when the server had to substitute a
+    // backend (e.g. SSB is unavailable at this sample rate) — LV-F2.
+    if (backend_requested && backend && backend !== backend_requested) {
+        const key = `${backend_requested}->${backend}`;
+        if (lastBackendWarn !== key) {
+            lastBackendWarn = key;
+            setStatus(`${backend_requested.toUpperCase()} unavailable at this rate — showing ${backend}`, "warn");
+            logMsg(`${backend_requested} unavailable at ${(fs / 1e6).toFixed(2)} MS/s — showing ${backend}`, "WARN");
+        }
+    } else if (lastBackendWarn !== null) {
+        lastBackendWarn = null;
+        setStatus("connected", "ok");
+    }
+
     if (tuningChanged) {
-        curNfft   = nfft;
+        curBins   = nfft;
         curCenter = center;
         curFs     = fs;
-        freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF);
+        curF0     = f0Val;
+        curStep   = stepVal;
+        freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF, curF0, curStep);
+        updateSsbOption();
         // Clear hold/min on tuning change (freq-axis specific)
         holdBuf[0] = holdBuf[1] = null;
         minBuf[0]  = minBuf[1]  = null;
@@ -257,7 +348,7 @@ const wfImageData = { 0: null, 1: null };
 
 function computeDisplayDepth(rows, nfft, fs) {
     if (replaceMode) return rows;
-    return rowsForWindow(fs, nfft, windowMs);
+    return rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
 }
 
 function updateWaterfall(ch, block, rows, nfft, center, fs) {
@@ -280,11 +371,16 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         buf.fill(-150);
         buf.set(block.subarray(0, Math.min(bLen, size)));
     } else {
-        // Scroll mode: shift existing rows down, prepend new rows at [0]
+        // Scroll mode: shift existing rows down, prepend new rows at [0].
         const newRows = Math.min(bLen / nfft, depth);
         const keep    = (depth - newRows) * nfft;
         if (keep > 0) buf.copyWithin(newRows * nfft, 0, keep);
-        buf.set(block.subarray(0, newRows * nfft));
+        // Write the block's rows reversed: the block is oldest-first, but row 0 of a
+        // downward-scrolling waterfall must be the newest row — otherwise each frame
+        // band is internally time-reversed (zigzag on bursty signals) — LV-R7.
+        for (let r = 0; r < newRows; r++) {
+            buf.set(block.subarray((newRows - 1 - r) * nfft, (newRows - r) * nfft), r * nfft);
+        }
     }
 
     // ── Auto color levels (5th / 99th percentile of a subsample) ──────────
@@ -315,6 +411,24 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
     wfCtx[ch].putImageData(wfImageData[ch], 0, 0);
 }
 
+// Populate the waterfall frequency-axis overlays (LV-F7). Five evenly spaced
+// ticks from the true axis (LV-F1) plus the current hop-aware window on the right.
+function renderWfAxis() {
+    if (!freqsMHz || !freqsMHz.length) return;
+    const divs = document.querySelectorAll(".wf-freq-axis");
+    if (!divs.length) return;
+    const n = freqsMHz.length;
+    let spans = "";
+    for (let k = 0; k < 5; k++) {
+        const i = Math.round((k / 4) * (n - 1));
+        spans += `<span>${freqsMHz[i].toFixed(1)} MHz</span>`;
+    }
+    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const winMs = (depthRows * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    spans += `<span class="wf-axis-win">↕ ${winMs} ms</span>`;
+    divs.forEach((d) => { d.innerHTML = spans; });
+}
+
 // ---------------------------------------------------------------------------
 // PSD (uPlot)
 // ---------------------------------------------------------------------------
@@ -335,6 +449,14 @@ const COL = {
     rx2Min:  "rgba(154,200,255,0.6)",
     diff:    "#e6e9ef",
 };
+
+// PSD y-axis label depends on the backend: calibrated/ssb values are band-
+// integrated over one averaged bin (~+8.5 dB vs per-bin); quicklook is per-bin.
+function psdYLabel() {
+    return curBackend === "quicklook"
+        ? "Power (dB rel. FS / bin)"
+        : "Integrated power (dB rel. FS)";
+}
 
 function initUplot(freqs) {
     const container = document.getElementById("psd-plot");
@@ -364,7 +486,7 @@ function initUplot(freqs) {
                 font:   "11px Menlo,monospace",
             },
             {
-                label:  "Power (dB)",
+                label:  psdYLabel(),
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -397,6 +519,11 @@ function initUplot(freqs) {
     const empty  = Array.from({ length: 9 }, () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
 
+    // Preserve the crosshair toggle across re-inits (a retune rebuilds the plot,
+    // which would otherwise silently reset the cursor to "on") — LV-R9a.
+    const crossChk = document.getElementById("cross-chk");
+    if (crossChk) uplot.cursor.show = crossChk.checked;
+
     // Set up band dragging on the uPlot canvas
     setupBandDrag();
 }
@@ -421,12 +548,15 @@ function psdSeries(channels, blocks, rows, nfft) {
             const off = r * nfft;
             for (let f = 0; f < nfft; f++) {
                 const v = buf[off + f];
-                m[f] += v;
+                m[f] += Math.pow(10, v / 10);   // accumulate LINEAR power (LV-F3)
                 if (v > x[f]) x[f] = v;
                 if (v < n[f]) n[f] = v;
             }
         }
-        for (let f = 0; f < nfft; f++) m[f] /= depth;
+        // Convert the linear-power mean back to dB. Averaging dB directly
+        // underreports the time-averaged power of fluctuating signals; this
+        // mirrors the band monitor's (correct) linear convention.
+        for (let f = 0; f < nfft; f++) m[f] = 10 * Math.log10(Math.max(m[f] / depth, 1e-20));
 
         mean[ch] = m;
         max[ch]  = x;
@@ -501,24 +631,29 @@ function updatePSD(channels, blocks, rows, nfft) {
     ];
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
-    // Peak marker (strongest bin of RX1 max)
-    if (peakMarker && s1x && !showDiff) {
-        drawPeakMarker(s1x, freqArr);
+    // Peak markers (strongest bin per visible channel) — LV-U1b
+    if (peakMarker && !showDiff) {
+        drawPeakMarker(s1x, s2x, freqArr);
     }
 
     // Fixed Y-span
     applyYspan();
 }
 
-// Peak marker: drawn each frame via uPlot's redraw hook
+// Peak markers: computed here, drawn each frame via uPlot's redraw hook. One per
+// channel (RX1/RX2 max traces), so the label is no longer RX1-only (LV-U1b).
 let peakMarkerData = null;
-function drawPeakMarker(s1x, freqArr) {
-    if (!s1x) { peakMarkerData = null; return; }
+function bestBin(arr, freqArr) {
+    if (!arr) return null;
     let bestI = 0;
-    for (let i = 1; i < s1x.length; i++) {
-        if (s1x[i] > s1x[bestI]) bestI = i;
+    for (let i = 1; i < arr.length; i++) {
+        if (arr[i] !== null && (arr[bestI] === null || arr[i] > arr[bestI])) bestI = i;
     }
-    peakMarkerData = { freq: freqArr[bestI], power: s1x[bestI] };
+    const v = arr[bestI];
+    return (v === null || v === undefined) ? null : { freq: freqArr[bestI], power: v };
+}
+function drawPeakMarker(s1x, s2x, freqArr) {
+    peakMarkerData = { rx1: bestBin(s1x, freqArr), rx2: bestBin(s2x, freqArr) };
 }
 
 // uPlot draw hook — overlays: peak marker, band selection
@@ -526,23 +661,26 @@ function drawPsdOverlays(u) {
     const ctx = u.ctx;
     ctx.save();
 
-    // ── Peak marker ──────────────────────────────────────────────────────
+    // ── Peak markers (one per visible channel) ────────────────────────────
     if (peakMarker && peakMarkerData && !showDiff) {
-        const { freq, power } = peakMarkerData;
-        const px = u.valToPos(freq,  "x", true);
-        const py = u.valToPos(power, "y", true);
-        if (px && py) {
+        const drawOne = (pm, color, tag) => {
+            if (!pm) return;
+            const px = u.valToPos(pm.freq,  "x", true);
+            const py = u.valToPos(pm.power, "y", true);
+            if (!px || !py) return;
             ctx.beginPath();
             ctx.arc(px, py, 5, 0, 2 * Math.PI);
-            ctx.fillStyle   = "#f5d750";
+            ctx.fillStyle   = color;
             ctx.strokeStyle = "#000";
             ctx.lineWidth   = 1;
             ctx.fill();
             ctx.stroke();
-            ctx.fillStyle = "#f5d750";
+            ctx.fillStyle = color;
             ctx.font      = "bold 11px Menlo,monospace";
-            ctx.fillText(`${freq.toFixed(3)} MHz  ${power.toFixed(1)} dB`, px + 8, py - 5);
-        }
+            ctx.fillText(`${tag} ${pm.freq.toFixed(3)} MHz  ${pm.power.toFixed(1)} dB`, px + 8, py - 5);
+        };
+        drawOne(peakMarkerData.rx1, COL.rx1Max, "RX1");
+        drawOne(peakMarkerData.rx2, COL.rx2Max, "RX2");
     }
 
     // ── Band selection region ─────────────────────────────────────────────
@@ -605,15 +743,17 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
     const lo = Math.min(bandLo, bandHi);
     const hi = Math.max(bandLo, bandHi);
 
-    // Gather in-band frequency indices
-    const mask = [];
-    for (let i = 0; i < nfft; i++) {
-        if (freqsMHz[i] >= lo && freqsMHz[i] <= hi) mask.push(i);
-    }
-    if (mask.length === 0) {
+    // freqsMHz is sorted ascending — find the in-band index range once, instead of
+    // an O(rows·nfft·bins) mask.includes() scan that froze at nfft 4096 (LV-R6).
+    let loIdx = 0;
+    while (loIdx < nfft && freqsMHz[loIdx] < lo) loIdx++;
+    let hiIdx = nfft - 1;
+    while (hiIdx >= 0 && freqsMHz[hiIdx] > hi) hiIdx--;
+    if (loIdx > hiIdx) {
         bandMonitorEl.textContent = `Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz: no bins`;
         return;
     }
+    const nBins = hiIdx - loIdx + 1;
 
     const band = {}, qual = {};
     for (const ch of [0, 1]) {
@@ -628,17 +768,17 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
             for (let i = 0; i < nfft; i++) {
                 const lin = Math.pow(10, buf[off + i] / 10);
                 sumAll += lin;
-                if (mask.includes(i)) sumInBand += lin;
+                if (i >= loIdx && i <= hiIdx) sumInBand += lin;
             }
         }
-        const linBand = sumInBand / (mask.length * depth);
+        const linBand = sumInBand / (nBins * depth);
         const linAll  = sumAll    / (nfft        * depth);
         band[ch] = 10 * Math.log10(Math.max(linBand, 1e-20));
         qual[ch] = 10 * Math.log10(Math.max(linBand, 1e-20))
                  - 10 * Math.log10(Math.max(linAll,  1e-20));
     }
 
-    const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${mask.length} bins)`];
+    const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${nBins} bins)`];
     if (band[0] !== undefined) segs.push(`RX1 ${band[0].toFixed(1)} dB`);
     if (band[1] !== undefined) segs.push(`RX2 ${band[1].toFixed(1)} dB`);
     if (band[0] !== undefined && band[1] !== undefined) {
@@ -744,7 +884,13 @@ function savePsdCsv() {
         return;
     }
     const nfft = freqsMHz.length;
-    const rows = ["freq_mhz,rx1_mean_db,rx1_max_db,rx2_mean_db,rx2_max_db"];
+    const rows = [
+        `# backend=${curBackend}`,
+        `# fft_nfft=${curFftNfft}`,
+        `# bin_avg=${curBinAvg}`,
+        `# units=dB (uncalibrated, ${curBackend === "quicklook" ? "per-bin" : "band-integrated"})`,
+        "freq_mhz,rx1_mean_db,rx1_max_db,rx2_mean_db,rx2_max_db",
+    ];
     for (let i = 0; i < nfft; i++) {
         const m0 = psdData.mean[0] ? psdData.mean[0][i].toFixed(3) : "";
         const x0 = psdData.max[0]  ? psdData.max[0][i].toFixed(3)  : "";
@@ -779,7 +925,10 @@ function exportPng() {
 
     // Settings caption
     const ts  = new Date().toLocaleString();
-    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${curNfft}`;
+    const capDepth = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const capWinMs = (capDepth * radioNfft * backendHopFrac() / curFs * 1e3).toFixed(0);
+    const capFft   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}→${curFftNfft}`;
+    const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${capFft}  window ${capWinMs} ms`;
     ctx.fillStyle = "#d0d0d0";
     ctx.font      = "11px Menlo,monospace";
     ctx.fillText(cap, 10, H - 8);
@@ -807,13 +956,17 @@ resizeObserver.observe(document.getElementById("psd-container"));
 // ---------------------------------------------------------------------------
 
 function rowsForCurrentSettings() {
-    return rowsForWindow(curFs, curNfft, windowMs);
+    return rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
 }
 
 function applyAnalysisMode() {
     document.body.classList.toggle("analysis-psd", analysisMode === "psd");
     document.body.classList.toggle("analysis-ssb", analysisMode === "ssb");
-    const backend = analysisMode === "ssb" ? "ssb" : "calibrated";
+    // "PSD view" is a client-only waterfall-hide toggle (backend stays calibrated);
+    // Quicklook selects the raw per-bin FFT backend the server already supports.
+    const backend = analysisMode === "ssb" ? "ssb"
+                  : analysisMode === "quicklook" ? "quicklook"
+                  : "calibrated";
     wfBuf[0] = wfBuf[1] = null;
     holdBuf[0] = holdBuf[1] = null;
     minBuf[0] = minBuf[1] = null;
@@ -832,7 +985,7 @@ document.getElementById("center-mhz").addEventListener("keydown", (e) => {
 document.getElementById("rate-sel").addEventListener("change", (e) => {
     const fs   = parseFloat(e.target.value) * 1e6;
     const ctrl = { sample_rate: fs };
-    if (replaceMode) ctrl.rows = rowsForWindow(fs, curNfft, windowMs);
+    if (replaceMode) ctrl.rows = rowsForWindow(fs, radioNfft, windowMs, backendHopFrac());
     sendControl(ctrl);
 });
 
@@ -846,13 +999,18 @@ document.getElementById("gain").addEventListener("keydown", (e) => {
 
 document.getElementById("nfft-sel").addEventListener("change", (e) => {
     const nfft = parseInt(e.target.value, 10);
+    radioNfft = nfft;   // the ONLY place radioNfft is updated
     const ctrl = { nfft };
-    if (replaceMode) ctrl.rows = rowsForWindow(curFs, nfft, windowMs);
+    if (replaceMode) ctrl.rows = rowsForWindow(curFs, radioNfft, windowMs, backendHopFrac());
     sendControl(ctrl);
 });
 
 document.getElementById("tune-btn").addEventListener("click", () => {
-    if (bandLo === null || bandHi === null || !absRF) return;
+    if (bandLo === null || bandHi === null) return;
+    if (!absRF) {
+        logMsg("Tune to band needs Absolute RF enabled", "WARN");   // LV-R9c
+        return;
+    }
     const lo = Math.min(bandLo, bandHi);
     const hi = Math.max(bandLo, bandHi);
     const newCenter = ((lo + hi) / 2) * 1e6;
@@ -886,15 +1044,24 @@ document.getElementById("win-sel").addEventListener("change", (e) => {
     if (replaceMode) sendControl({ rows: rowsForCurrentSettings() });
 });
 
+document.getElementById("fps-sel").addEventListener("change", (e) => {
+    maxFps = parseFloat(e.target.value) || 15;   // client-side render cap (LV-U1a)
+});
+
 document.getElementById("auto-color").addEventListener("change", (e) => {
     autoColor = e.target.checked;
 });
 
+document.getElementById("lo-null").addEventListener("change", (e) => {
+    sendControl({ lo_null: e.target.checked });   // server-side DC-null toggle (LV-F8)
+});
+
 document.getElementById("abs-rf").addEventListener("change", (e) => {
     absRF    = e.target.checked;
-    freqsMHz = buildFreqsMHz(curCenter, curFs, curNfft, absRF);
+    freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
     if (uplot && freqsMHz) initUplot(freqsMHz);
     resetBand(freqsMHz);
+    renderWfAxis();
 });
 
 document.getElementById("reset-btn").addEventListener("click", () => {
@@ -1081,7 +1248,17 @@ async function loadSchema(seed = {}) {
 }
 
 document.getElementById("settings-apply").addEventListener("click", () => {
-    sendControl(collectSettings());
+    // Merge the hidden lower-level params from an uploaded sweep JSON under the
+    // visible form values (form wins), so uploading a sweep actually seeds them
+    // instead of being silently dropped (LV-F6).
+    const form = collectSettings();
+    const hiddenCapture = (hiddenSweepSettings.captures && hiddenSweepSettings.captures[0]) || {};
+    const hiddenSource  = hiddenSweepSettings.source || {};
+    const payload = {
+        capture: { ...hiddenCapture, ...form.capture },
+        source:  { ...hiddenSource,  ...form.source  },
+    };
+    sendControl(payload);
     logMsg("Settings sent");
 });
 
@@ -1106,8 +1283,9 @@ bandLo = -curFs / 1e6 * 0.05;
 bandHi =  curFs / 1e6 * 0.05;
 
 // Init PSD with placeholder data so layout is in place
-freqsMHz = buildFreqsMHz(curCenter, curFs, curNfft, absRF);
+freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
 initUplot(freqsMHz);
+updateSsbOption();
 
 connect();
 loadSchema().catch((err) => logMsg(`Schema load failed: ${err.message}`, "ERROR"));

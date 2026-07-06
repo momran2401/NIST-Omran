@@ -729,7 +729,7 @@ class Acquirer(threading.Thread):
                         timeout_sec=count / cfg.sample_rate + 0.1,
                         on_overflow="log",
                     )
-                except (ReceiveStreamError, OverflowError, OSError) as e:
+                except (ReceiveStreamError, OverflowError, OSError, RuntimeError) as e:
                     try:
                         read_size, tmp, buffers = self.recover_radio(cfg, str(e))
                     except Exception as recover_err:

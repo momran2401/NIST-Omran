@@ -63,7 +63,7 @@
 
         <div class="field-row">
             <label>Gain (dB)
-                <input type="number" id="gain" step="0.5" min="-30" max="0" value="0">
+                <input type="number" id="gain" step="0.5" min="-60" max="10" value="0" title="AIR-T RX gain">
             </label>
             <button id="gain-btn">Apply</button>
         </div>
@@ -96,7 +96,8 @@
         <label>Analysis
             <select id="analysis-sel">
                 <option value="spectrogram" selected>Spectrogram</option>
-                <option value="psd">PSD</option>
+                <option value="quicklook">Quicklook (raw FFT)</option>
+                <option value="psd">PSD view</option>
                 <option value="ssb">SSB spectrogram</option>
             </select>
         </label>
@@ -113,7 +114,18 @@
             </select>
         </label>
 
+        <label class="pro-only" title="Cap the browser render rate (drops excess frames)">Max fps
+            <select id="fps-sel">
+                <option value="15" selected>15</option>
+                <option value="10">10</option>
+                <option value="5">5</option>
+                <option value="2">2</option>
+                <option value="1">1</option>
+            </select>
+        </label>
+
         <label class="check pro-only"><input type="checkbox" id="auto-color" checked> Auto color</label>
+        <label class="check pro-only" title="Blank the LO leakage region at band center (calibrated/SSB only)"><input type="checkbox" id="lo-null" checked> LO null</label>
         <label class="check pro-only"><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
 
         <button id="reset-btn" class="pro-only">Reset view</button>
@@ -158,7 +170,7 @@
             <div id="capture-settings-form" class="settings-grid"></div>
         </div>
         <div class="settings-col">
-            <h3>Source <span class="reconnect-badge">requires reconnect</span></h3>
+            <h3>Source <span class="reconnect-badge">requires reconnect — not applied live</span></h3>
             <div id="source-settings-form" class="settings-grid"></div>
         </div>
     </div>

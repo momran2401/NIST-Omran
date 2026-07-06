@@ -1,5 +1,7 @@
 # Bug Report — `live/` Folder
 
+> **HISTORICAL — verified fixed 2026-07-06, see `AUDIT_REPORT.md` §5.C; note S-5 was erroneous (`np.hanning` is not deprecated and the suggested `np.hann` does not exist). This document describes the pre-fix state; for the current backlog see `AUDIT_REPORT.md` and `FIXLOG.md`.**
+
 **Repository:** NIST-Omran  
 **Scope:** All files inside `live/`  
 **Reviewer:** Claude (read-only inspection — no code was modified)  

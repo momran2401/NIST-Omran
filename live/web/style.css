@@ -407,13 +407,24 @@ button.active {
 }
 
 .wf-freq-axis {
-    /* Overlay for frequency axis labels */
+    /* Overlay for frequency axis labels (populated by app.js renderWfAxis) */
     position: absolute;
     bottom: 0;
     left: 0;
     right: 0;
     height: 16px;
     pointer-events: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 4px;
+    font: 10px Menlo, monospace;
+    color: #c8d2e0;
+    text-shadow: 0 0 3px #000, 0 0 3px #000;
+}
+
+.wf-freq-axis .wf-axis-win {
+    color: #f5d750;
 }
 
 /* ── PSD row ──────────────────────────────────────────────────────────────── */

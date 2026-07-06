@@ -140,6 +140,17 @@ BROADCAST_FPS       = 15        # default max frames/sec to browsers
 SCROLL_ROWS         = 12        # rows per frame in Cool (scroll/waterfall) mode
 MAX_LIVE_ROWS       = 300       # safety cap on requested rows
 
+# Allowed sample rates (LTE/5G-NR multiples of 1.92 MHz) and FFT sizes. Incoming
+# control values are snapped to the nearest of these so an off-list value can't
+# reach arm_spec or trip the calibrated ValueError guard (LV-R2).
+RATES_HZ      = (3.84e6, 7.68e6, 15.36e6, 30.72e6)
+NFFT_CHOICES  = (256, 512, 1024, 2048, 4096)
+
+
+def _snap(value, choices):
+    return min(choices, key=lambda c: abs(c - value))
+
+
 WEB_DIR = Path(__file__).parent / "web"
 
 # Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
@@ -292,17 +303,27 @@ class BasicAuthMiddleware:
         self.app = app
 
     @staticmethod
-    def _set_cookie_send(send):
+    def _set_cookie_send(scope, send):
         """
         Wrap `send` to append a Set-Cookie header carrying a fresh session token
         on the HTTP response start. Only the success path uses this, so the
-        cookie is never attached to a 401.
+        cookie is never attached to a 401. The `Secure` attribute is omitted over
+        plain HTTP (LAN) so Safari/iOS — which refuse to store a Secure cookie
+        without TLS and won't replay Basic on the WS upgrade — can still reach /ws
+        (LV-R8). HttpOnly and SameSite=Lax are always set.
         """
+        headers_in = dict(scope.get("headers") or [])
+        is_https = (
+            scope.get("scheme") == "https"
+            or headers_in.get(b"x-forwarded-proto") == b"https"
+        )
+        secure_attr = "Secure; " if is_https else ""
+
         async def wrapped(message):
             if message["type"] == "http.response.start":
                 cookie = (
                     f"radio_auth={make_session_token()}; Path=/; HttpOnly; "
-                    f"Secure; SameSite=Lax; Max-Age={SESSION_TTL}"
+                    f"{secure_attr}SameSite=Lax; Max-Age={SESSION_TTL}"
                 )
                 headers = list(message.get("headers") or [])
                 headers.append((b"set-cookie", cookie.encode("latin-1")))
@@ -324,7 +345,7 @@ class BasicAuthMiddleware:
             if scope["type"] == "http":
                 # Refresh the session cookie so the browser carries it on the
                 # WS handshake. Never set it on websocket scopes.
-                await self.app(scope, receive, self._set_cookie_send(send))
+                await self.app(scope, receive, self._set_cookie_send(scope, send))
             else:
                 await self.app(scope, receive, send)
             return
@@ -390,6 +411,7 @@ class RadioConfig:
     nfft:        int   = DEFAULT_NFFT
     rows:        int   = DEFAULT_ROWS
     backend:     str   = SPEC_BACKEND
+    lo_null:     bool  = True
 
     def snapshot(self):
         return RadioConfig(
@@ -399,6 +421,7 @@ class RadioConfig:
             nfft=int(self.nfft),
             rows=int(self.rows),
             backend=str(self.backend),
+            lo_null=bool(self.lo_null),
         )
 
 
@@ -413,8 +436,13 @@ class SharedConfig:
         with self._lock:
             return self._cfg.snapshot()
 
-    def update(self, update: dict) -> bool:
-        """Apply key/value updates. Returns True if anything changed."""
+    def update(self, update: dict) -> dict:
+        """Apply key/value updates. Returns an ack {applied, ignored, reconnect}."""
+        ignored = []
+        reconnect = []
+        # Capture fields that map to a live radio parameter; the rest are rendered
+        # by the editor but cannot be applied live — reported, not dropped (LV-F6).
+        capture_mapped = {"center_frequency", "sample_rate", "gain", "duration"}
         if "capture" in update and isinstance(update["capture"], dict):
             capture = update["capture"]
             mapped = {}
@@ -427,23 +455,30 @@ class SharedConfig:
             if capture.get("duration") is not None:
                 try:
                     with self._lock:
-                        nfft = self._cfg.nfft
-                        sample_rate = self._cfg.sample_rate
-                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
+                        cur_nfft = self._cfg.nfft
+                        cur_rate = self._cfg.sample_rate
+                    # Map duration→rows using values from THIS message when it also
+                    # changes them, not the pre-update cfg (LV-R9b).
+                    nfft        = capture.get("nfft") or cur_nfft
+                    sample_rate = capture.get("sample_rate") or cur_rate
+                    rows = round(float(capture["duration"]) * float(sample_rate) / max(int(nfft), 1))
                     mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
                 except Exception:
                     pass
+            ignored = sorted(
+                k for k, v in capture.items() if v is not None and k not in capture_mapped
+            )
             update = dict(update)
             update.update(mapped)
 
         if "source" in update and isinstance(update["source"], dict):
-            allowed = sorted(k for k in update["source"] if k not in {
+            reconnect = sorted(k for k, v in update["source"].items() if v is not None and k not in {
                 "receive_retries", "adc_overload_limit", "if_overload_limit", "gapless",
             })
-            if allowed:
-                print(f"[config] source changes require reconnect: {allowed}")
+            if reconnect:
+                print(f"[config] source changes require reconnect: {reconnect}")
 
-        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend"}
+        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend", "lo_null"}
         changes = []
         with self._lock:
             for key, value in update.items():
@@ -453,6 +488,8 @@ class SharedConfig:
                     value = str(value).strip().lower()
                     if value not in BACKENDS:
                         continue
+                elif key == "lo_null":
+                    value = bool(value)
                 else:
                     value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows so a misbehaving browser can't overload the radio
@@ -461,10 +498,12 @@ class SharedConfig:
                 elif key == "center":
                     value = float(max(300e6, min(value, 6e9)))
                 elif key == "sample_rate":
+                    value = float(_snap(value, RATES_HZ))
                     value = float(max(1e6, min(value, 125e6)))
                 elif key == "gain":
                     value = float(max(-60.0, min(value, 10.0)))
                 elif key == "nfft":
+                    value = int(_snap(value, NFFT_CHOICES))
                     value = int(max(128, min(value, 8192)))
                 old = getattr(self._cfg, key)
                 if old == value:
@@ -476,7 +515,7 @@ class SharedConfig:
         # Print outside the lock to avoid I/O inside a mutex
         for key, old, value in changes:
             print(f"[config] {key}: {old} -> {value}")
-        return bool(changes)
+        return {"applied": [k for k, _, _ in changes], "ignored": ignored, "reconnect": reconnect}
 
     def take_dirty(self):
         with self._lock:
@@ -638,22 +677,27 @@ def db_spectrogram(samples: np.ndarray, nfft: int, rows: int) -> np.ndarray:
     spec   = np.fft.fftshift(np.fft.fft(x, axis=-1), axes=-1)
     # Normalize by window power (proper PSD estimate)
     power  = (np.abs(spec) ** 2) / max(float(np.sum(window ** 2)), 1.0)
-    return (10.0 * np.log10(power + 1e-20)).astype(np.float32)
+    spg = (10.0 * np.log10(power + 1e-20)).astype(np.float32)
+    # Quicklook is a plain fftshifted per-bin FFT: fft_nfft = nfft, no averaging.
+    return spg, {"fft_nfft": int(nfft), "bin_avg": 1}
 
 
 def calibrated_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
-) -> np.ndarray:
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
+) -> tuple:
     """
     striqt-calibrated PSD spectrogram with symbol-style overlap/fill and
-    frequency-bin averaging. Returns (channels, rows, bins) float32.
+    frequency-bin averaging. Returns (blocks, meta) — blocks (channels, rows,
+    bins) float32, meta {fft_nfft, bin_avg}.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
     nfft = aligned_nfft(nfft)
-    needed  = rows * nfft
+    # Right-size to exactly `rows` STFT rows under the 13/28 overlap, rather than
+    # computing ~1.87×rows rows and discarding all but the last `rows` (LV-W2).
+    needed  = calibrated_sample_count(nfft, rows)
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
         samples = np.concatenate([samples, pad], axis=1)
@@ -681,15 +725,20 @@ def calibrated_spectrogram(
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
-    return fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
+    blocks = fit_display_rows(
+        np.asarray(spg, dtype=np.float32), rows,
+        bin_avg=average_bins, fft_nfft=nfft, sample_rate=sample_rate, lo_null=lo_null,
+    )
+    return blocks, {"fft_nfft": int(nfft), "bin_avg": int(average_bins)}
 
 
 def ssb_spectrogram(
-    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
-) -> np.ndarray:
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float, lo_null: bool = True
+) -> tuple:
     """
     5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
     are flattened to the dashboard's existing rows x bins frame contract.
+    Returns (blocks, meta).
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
@@ -721,16 +770,30 @@ def ssb_spectrogram(
         # The live viewer's power-of-two sample-rate/FFT controls are not
         # always compatible with the strict 30 kHz SSB grid. Keep the selector
         # useful by falling back to the same 13/28, 15/28 averaged grid.
-        return calibrated_spectrogram(samples, nfft, rows, sample_rate)
+        return calibrated_spectrogram(samples, nfft, rows, sample_rate, lo_null=lo_null)
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim == 4:
         spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
-    return fit_display_rows(spg, rows)
+    # Real SSB uses 15 kHz (subcarrier_spacing/2) resolution; best-effort axis
+    # params (this path is unreachable at the selectable sample rates — LV-F2).
+    ssb_nfft = max(1, round(sample_rate / (SSB_SUBCARRIER_SPACING / 2)))
+    blocks = fit_display_rows(
+        spg, rows,
+        bin_avg=1, fft_nfft=ssb_nfft, sample_rate=sample_rate, lo_null=lo_null,
+    )
+    return blocks, {"fft_nfft": int(ssb_nfft), "bin_avg": 1}
+
+
+# Snap the requested FFT size to a smooth multiple of 28 that is ALSO divisible
+# by 12 (so averaging_factor returns 12 consistently) and 7-smooth (2^a·3^b·7 —
+# fast scipy/pocketfft sizes). Avoids the slow non-power-of-2 sizes the old
+# round(n/28)·28 produced (1024→1036=2^2·7·37, 2048→2044=2^2·7·73), which drove
+# the calibrated cadence and made the bin-averaging factor non-monotonic.
+ALIGNED_NFFTS = (252, 504, 1008, 2016, 4032)   # 28·{9,18,36,72,144}
 
 
 def aligned_nfft(nfft: int) -> int:
-    nfft = max(28, int(nfft))
-    return max(28, int(round(nfft / 28)) * 28)
+    return min(ALIGNED_NFFTS, key=lambda n: abs(n - int(nfft)))
 
 
 def averaging_factor(nfft: int) -> int:
@@ -740,7 +803,29 @@ def averaging_factor(nfft: int) -> int:
     return 1
 
 
-def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
+def calibrated_sample_count(nfft: int, rows: int) -> int:
+    """
+    Samples needed to produce exactly `rows` STFT rows under the 13/28 overlap.
+    Each displayed row advances the STFT by hop = nfft·15/28 samples, so
+    rows·hop + (nfft-hop) samples suffice — instead of the ~1.87× that rows·nfft
+    would compute and then discard (see AUDIT_REPORT.md LV-W2). `nfft` must be an
+    aligned FFT size (multiple of 28) so the hop divides evenly; the count then
+    reproduces striqt's own row formula int((nfft/hop)·(N/nfft-1)+1) == rows.
+    """
+    nfft = int(nfft)
+    hop = (nfft * 15) // 28
+    return int(rows * hop + (nfft - hop))
+
+
+def fit_display_rows(
+    spg: np.ndarray,
+    rows: int,
+    *,
+    bin_avg: int = 1,
+    fft_nfft=None,
+    sample_rate=None,
+    lo_null: bool = True,
+) -> np.ndarray:
     """Crop/pad a striqt spectrogram to the dashboard row contract."""
     spg = np.asarray(spg, dtype=np.float32)
     if spg.ndim != 3:
@@ -756,18 +841,33 @@ def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
             )
             spg = np.concatenate([pad, spg], axis=1)
 
-    # Null the LO leakage region after any frequency bin averaging.
-    if spg.shape[2] >= 5:
+    # Null the LO leakage region, sized to the striqt bandstop instead of a fixed
+    # ±2 bins (which hid up to ~3.7 MHz of real spectrum at coarse FFTs). Optional
+    # via the lo_null flag so the center can be revealed (LV-F8).
+    if lo_null and spg.shape[2] >= 3 and fft_nfft and sample_rate:
+        step = max(1, bin_avg) * float(sample_rate) / float(fft_nfft)   # Hz per averaged bin
+        half = max(1, math.ceil((SSB_LO_BANDSTOP / 2) / step))
         c = spg.shape[-1] // 2
-        lo = max(0, c - 2)
-        hi = min(spg.shape[-1], c + 3)
+        lo = max(0, c - half)
+        hi = min(spg.shape[-1], c + half + 1)
         spg[:, :, lo:hi] = np.nanmin(spg, axis=-1, keepdims=True)
+
+    # ALWAYS scrub remaining NaNs (striqt's null_lo leaves an all-NaN DC group) to
+    # the per-row min so the quantizer and client never see NaN garbage (LV-F8/R4).
+    if np.isnan(spg).any():
+        row_min = np.nanmin(np.where(np.isnan(spg), np.float32(np.inf), spg), axis=-1, keepdims=True)
+        row_min = np.where(np.isfinite(row_min), row_min, np.float32(-200.0))
+        spg = np.where(np.isnan(spg), row_min, spg).astype(np.float32)
     return spg
 
 
 def samples_needed(cfg: RadioConfig) -> int:
-    nfft = aligned_nfft(cfg.nfft) if cfg.backend in {"calibrated", "ssb"} else cfg.nfft
-    base = int(nfft * cfg.rows)
+    if cfg.backend in {"calibrated", "ssb"}:
+        # Overlapped STFT: only rows·hop + (nfft-hop) samples are needed to
+        # produce cfg.rows display rows (LV-W2), not the full nfft·rows.
+        base = calibrated_sample_count(aligned_nfft(cfg.nfft), cfg.rows)
+    else:
+        base = int(cfg.nfft * cfg.rows)
     if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
         ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
         return max(base, ssb)
@@ -779,16 +879,78 @@ def ssb_grid_compatible(sample_rate: float) -> bool:
     return nfft > 0 and (13 * nfft) % 28 == 0
 
 
-def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
+def compute_blocks(samples: np.ndarray, cfg: RadioConfig):
     """
     Dispatch to the configured backend.
-    Returns (channels, rows, bins) float32.
+    Returns (blocks, meta): blocks is (channels, rows, bins) float32; meta carries
+    the per-frame axis parameters (fft_nfft, bin_avg) and the executed backend,
+    used by build_header to ship an honest frame header (LV-F1/F2).
     """
-    if cfg.backend == "calibrated":
-        return calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
-    if cfg.backend == "ssb":
-        return ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
-    return db_spectrogram(samples, cfg.nfft, cfg.rows)
+    requested = cfg.backend
+    if requested == "ssb" and not ssb_grid_compatible(cfg.sample_rate):
+        # SSB requires a sample rate on the 420 kHz grid; none of the selectable
+        # rates qualify, so skip the striqt call (which would raise and fall back
+        # every frame) and run calibrated directly, reporting it honestly (LV-F2).
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        executed = "calibrated"
+    elif requested == "calibrated":
+        blocks, meta = calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        executed = "calibrated"
+    elif requested == "ssb":
+        blocks, meta = ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate, lo_null=cfg.lo_null)
+        executed = "ssb"
+    else:
+        blocks, meta = db_spectrogram(samples, cfg.nfft, cfg.rows)
+        executed = "quicklook"
+    meta["backend"] = executed
+    meta["backend_requested"] = requested
+    return blocks, meta
+
+
+def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False) -> dict:
+    """
+    Assemble the frame header from cfg + the per-frame backend meta. Ships the
+    TRUE frequency axis (freqs_hz_f0/freqs_hz_step) and the executed backend so
+    the client never has to guess it (LV-F1/F2). fft_nfft/bin_avg disclose the
+    real FFT size and bin-averaging behind the reported `nfft` bin count.
+    """
+    first = np.asarray(blocks[0], dtype=np.float32)
+    rows, bins = first.shape
+    fs = float(cfg.sample_rate)
+    executed = str(meta.get("backend", cfg.backend))
+    fft_nfft = int(meta.get("fft_nfft", bins)) or int(bins)
+    bin_avg  = int(meta.get("bin_avg", 1)) or 1
+
+    # Frequency axis. Quicklook is a plain fftshifted FFT (bin 0 = -fs/2); the
+    # calibrated/ssb path DC-centers bin_avg-wide averaged groups, so their
+    # centers are symmetric about DC with step = bin_avg*fs/fft_nfft.
+    step = bin_avg * fs / fft_nfft
+    if executed == "quicklook":
+        f0 = -fs / 2.0
+    else:
+        f0 = -(bins - 1) / 2.0 * step
+
+    header = {
+        "center":        float(cfg.center),
+        "fs":            fs,
+        "gain":          float(cfg.gain),
+        "nfft":          int(bins),
+        "rows":          int(rows),
+        "shape":         [int(rows), int(bins)],
+        "channels":      list(CHANNELS),
+        "backend":       executed,
+        "fft_nfft":      fft_nfft,
+        "bin_avg":       bin_avg,
+        "freqs_hz_f0":   float(f0),
+        "freqs_hz_step": float(step),
+        "time":          time.time(),
+    }
+    requested = str(meta.get("backend_requested", executed))
+    if requested != executed:
+        header["backend_requested"] = requested
+    if demo:
+        header["demo"] = True
+    return header
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +989,7 @@ class Acquirer(threading.Thread):
         self._count       = 0      # total samples written (saturates at MAX_TAIL)
         self._last_write  = 0.0
         self._healthy     = False
+        self._gen         = 0      # bumped on every ring clear (retune/recover) — LV-R5
 
     # --- Latest-frame slot (thread-safe) ---
 
@@ -837,20 +1000,8 @@ class Acquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
-    def publish(self, cfg: RadioConfig, blocks: list):
-        first = np.asarray(blocks[0], dtype=np.float32)
-        rows, bins = first.shape
-        header = {
-            "center":   float(cfg.center),
-            "fs":       float(cfg.sample_rate),
-            "gain":     float(cfg.gain),
-            "nfft":     int(bins),
-            "rows":     int(rows),
-            "shape":    [int(rows), int(bins)],
-            "channels": list(CHANNELS),
-            "backend":  str(cfg.backend),
-            "time":     time.time(),
-        }
+    def publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        header = build_header(cfg, blocks, meta, demo=False)
         with self._pub_lock:
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
@@ -862,6 +1013,7 @@ class Acquirer(threading.Thread):
         self._count      = 0
         self._last_write = 0.0
         self._healthy    = False
+        self._gen       += 1   # invalidate frames straddling this retune/recover (LV-R5)
 
     def _ring_write(self, iq):
         """Append raw IQ (channels, n) into the ring buffer with wraparound."""
@@ -890,12 +1042,17 @@ class Acquirer(threading.Thread):
             self._last_write = time.time()
             self._healthy    = True
 
+    def generation(self):
+        with self._lock:
+            return self._gen
+
     def get_latest(self, n):
         """
-        Return the most recent `n` complex samples per channel, shape
-        (channels, n) complex64, chronological (oldest -> newest). Front-padded
-        with zeros if fewer than `n` exist. Returns None if the ring is empty or
-        stale (so frames never mix old-tuning samples after a retune).
+        Return (out, gen, avail): the most recent `n` complex samples per channel,
+        shape (channels, n) complex64, chronological (oldest -> newest), front-padded
+        with zeros if fewer than `n` exist; `gen` is the ring generation and `avail`
+        the real sample count. Returns None if the ring is empty or stale (so frames
+        never mix old-tuning samples after a retune).
         """
         n = int(n)
         if n <= 0:
@@ -916,7 +1073,8 @@ class Acquirer(threading.Thread):
                 first = cap - start
                 out[:, n - take:n - take + first] = self._ring[:, start:]
                 out[:, n - take + first:]         = self._ring[:, : take - first]
-        return out
+            gen = self._gen
+        return out, gen, avail
 
     # --- Hardware management ---
 
@@ -1004,7 +1162,7 @@ class Acquirer(threading.Thread):
                         timeout_sec=read_size / cfg.sample_rate + 0.1,
                         on_overflow="log",
                     )
-                except (ReceiveStreamError, OverflowError, OSError) as e:
+                except (ReceiveStreamError, OverflowError, OSError, RuntimeError) as e:
                     try:
                         read_size, tmp, buffers = self._recover(cfg, str(e))
                     except Exception as re:
@@ -1057,16 +1215,26 @@ class Computer(threading.Thread):
         next_t   = time.time()
         while not self.shared.stopped():
             cfg     = self.shared.snapshot()
-            samples = self.acquirer.get_latest(samples_needed(cfg))
-            if samples is None:
+            need    = samples_needed(cfg)
+            g0      = self.acquirer.generation()
+            latest  = self.acquirer.get_latest(need)
+            if latest is None:
                 # Ring empty/stale (startup or just after a retune) — wait.
+                time.sleep(0.03)
+                next_t = time.time()
+                continue
+            samples, gen, avail = latest
+            # Skip frames straddling a retune: the ring was cleared (gen bumped) or
+            # hasn't refilled yet (avail < need). Either would publish zero-padded
+            # dark rows or mislabel old-band energy with the new header (LV-R5).
+            if gen != g0 or avail < need:
                 time.sleep(0.03)
                 next_t = time.time()
                 continue
 
             try:
-                blocks = compute_blocks(samples, cfg)
-                self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
+                blocks, meta = compute_blocks(samples, cfg)
+                self.acquirer.publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
             except Exception as e:
                 print(f"[compute] error: {e}")
 
@@ -1103,21 +1271,8 @@ class DemoAcquirer(threading.Thread):
                 return None, None
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
-    def _publish(self, cfg: RadioConfig, blocks: list):
-        first = np.asarray(blocks[0], dtype=np.float32)
-        rows, bins = first.shape
-        header = {
-            "center":   float(cfg.center),
-            "fs":       float(cfg.sample_rate),
-            "gain":     float(cfg.gain),
-            "nfft":     int(bins),
-            "rows":     int(rows),
-            "shape":    [int(rows), int(bins)],
-            "channels": list(CHANNELS),
-            "backend":  str(cfg.backend),
-            "time":     time.time(),
-            "demo":     True,
-        }
+    def _publish(self, cfg: RadioConfig, blocks: list, meta: dict):
+        header = build_header(cfg, blocks, meta, demo=True)
         with self._lock:
             self._latest_header = header
             self._latest_blocks = [np.asarray(b, dtype=np.float32) for b in blocks]
@@ -1152,8 +1307,8 @@ class DemoAcquirer(threading.Thread):
 
             samples = np.stack([sig0 + noise0, sig1 + noise1])
             try:
-                blocks = compute_blocks(samples, cfg)
-                self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])])
+                blocks, meta = compute_blocks(samples, cfg)
+                self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
             except Exception as e:
                 print(f"[demo] compute error: {e}")
 
@@ -1187,10 +1342,14 @@ def serialize_frame(header: dict, blocks: list, quantize: bool = False) -> bytes
     dequantized blocks, which differ from float32 by at most 1/255 of the dB range.
     """
     if quantize and blocks:
-        # Use per-frame global range so quantization is consistent across channels
+        # Use per-frame global range so quantization is consistent across channels.
+        # NaN-safe: a single NaN would make np.percentile return NaN and turn the
+        # whole uint8 frame to garbage (LV-R4).
         all_vals = np.concatenate([b.ravel() for b in blocks])
-        vmin = float(np.percentile(all_vals, 1))
-        vmax = float(np.percentile(all_vals, 99))
+        vmin = float(np.nanpercentile(all_vals, 1))
+        vmax = float(np.nanpercentile(all_vals, 99))
+        if not (np.isfinite(vmin) and np.isfinite(vmax)):
+            vmin, vmax = -100.0, 0.0   # all-NaN block fallback
         if vmax - vmin < 1.0:
             vmax = vmin + 1.0
         hdr       = dict(header, dtype="uint8", scale=[vmin, vmax])
@@ -1198,7 +1357,7 @@ def serialize_frame(header: dict, blocks: list, quantize: bool = False) -> bytes
         parts     = [struct.pack("<I", len(hdr_bytes)), hdr_bytes]
         rng       = vmax - vmin
         for block in blocks:
-            u8 = ((np.asarray(block, dtype=np.float32) - vmin) / rng * 255
+            u8 = ((np.nan_to_num(np.asarray(block, dtype=np.float32), nan=vmin) - vmin) / rng * 255
                   ).clip(0, 255).astype(np.uint8)
             parts.append(u8.tobytes(order="C"))
     else:
@@ -1219,6 +1378,7 @@ _computer: "Computer | None"                 = None
 _shared:   "SharedConfig | None"             = None
 _quantize: bool                              = False
 _connections: set                            = set()
+_slot_lock                                   = asyncio.Lock()  # guards the single-viewer slot
 
 
 @asynccontextmanager
@@ -1352,24 +1512,50 @@ async def ws_endpoint(ws: WebSocket):
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
     Sends spectrogram frames as binary (see serialize_frame).
     """
-    if _connections:
-        await ws.close(code=1008)
-        print(f"[ws] refused extra client: {ws.client}")
-        return
-
-    await ws.accept()
-    _connections.add(ws)
+    # Single-viewer slot, guarded so two interleaving handshakes can't both pass
+    # the empty check (LV-R3). Busy refusals use a distinct 4001 code (vs 1008 for
+    # auth) so the client can tell "another viewer connected" from "unauthorized".
+    async with _slot_lock:
+        if _connections:
+            await ws.accept()
+            await ws.close(code=4001)
+            print(f"[ws] refused extra client (slot busy): {ws.client}")
+            return
+        await ws.accept()
+        _connections.add(ws)
     client = ws.client
     print(f"[ws] client connected: {client}")
+    misses = 0
     try:
         while True:
             try:
                 text = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
-                ctrl = json.loads(text)
-                _shared.update(ctrl)
             except asyncio.TimeoutError:
-                # Keepalive: connection stays open, no data in 15 s is normal
-                pass
+                # Liveness probe: if the client is gone, free the slot promptly (so a
+                # waiting viewer's reconnect can take over) instead of holding it until
+                # TCP times out minutes later (LV-R3).
+                try:
+                    await ws.send_text('{"message":"ping"}')
+                    misses = 0
+                except Exception:
+                    misses += 1
+                    if misses >= 2:
+                        print(f"[ws] client {client} unresponsive; dropping")
+                        break
+                continue
+            try:
+                ctrl = json.loads(text)
+                ack = _shared.update(ctrl)
+                # Acknowledge settings-editor applies so the UI can show what took
+                # effect vs what was ignored or needs a reconnect (LV-F6).
+                if isinstance(ctrl, dict) and ("capture" in ctrl or "source" in ctrl):
+                    await ws.send_text(json.dumps({"message":
+                        f"settings — applied {ack['applied']}; "
+                        f"ignored {ack['ignored']}; reconnect-only {ack['reconnect']}"}))
+            except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+                # A single malformed control message must never drop the (only)
+                # viewer connection (LV-R2).
+                await ws.send_text(json.dumps({"message": f"bad control ignored: {e}"}))
     except WebSocketDisconnect:
         pass
     except Exception as e:

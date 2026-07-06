@@ -83,14 +83,15 @@ FastAPI app (uvicorn)          _broadcaster() asyncio task
 - `live/web/app.js` parses binary frames, renders waterfalls via `ImageData` + viridis LUT (`colormap.js`), and renders PSD via uPlot.
 - Band monitor computes power in the **linear** domain (correct; avoids the dB-averaging error in older scripts).
 
-## Known bugs (see `bug_report.md` for full detail)
+## Known bugs
 
-Critical / High issues to be aware of when modifying the live scripts:
-
-- **A-1 / P-3** (`striqt_standalone.py`, `pluto_standalone.py`) — Acquirer thread dies permanently when `recover_radio()` fails during a dirty-config cycle because there is no `if self.source is None:` guard before `_read_stream`. The terminal version and the web server both have this guard. Fix: add `if self.source is None: ... continue` before the `_read_stream` call.
-- **F-3 / A-3** — Band-power averaging done in dB domain in the TCP frontend and Qt standalone scripts (should convert to linear first, average, then convert back). The web viewer correctly computes this in linear.
-- **T-1** (`striqt_standalone_terminal.py`) — `quick_spectrogram` off by ~30 dB due to missing normalization. The web server's `db_spectrogram` uses `np.sum(window**2)` normalization (correct).
-- **S-1/S-2** (`striqt_server_TCP.py`) — Acquirer has no stream error recovery and doesn't refresh read buffers after rearm. Both are fixed in the web server.
+Every issue in `bug_report.md` (A-1/P-3, F-3/A-3, T-1, S-1/S-2, F-2, P-5) was already
+fixed in the current tree — verified 2026-07-06 (see `AUDIT_REPORT.md` §5.C). The old
+"Known bugs" list here described the pre-fix state and was actively misleading (it told
+future sessions to re-add guards that already exist), so it has been removed. For the
+**current** backlog of live-viewer issues and their fixes, see `AUDIT_REPORT.md` §2/§5 and
+`FIXLOG.md` at the repo root. Note `bug_report.md` S-5 was erroneous: `np.hanning` is not
+deprecated and the suggested `np.hann` does not exist.
 
 ## Key constants
 
@@ -105,7 +106,9 @@ Critical / High issues to be aware of when modifying the live scripts:
 
 ## striqt.analysis spectrogram contract
 
-`evaluate_spectrogram` sets `nfft = round(sample_rate / frequency_resolution)` internally. To guarantee `spg.shape == (channels, rows, nfft)`, pass `frequency_resolution = sample_rate / nfft` and `duration = rows * nfft / sample_rate`. Always clear `striqt_shared.spectrogram_cache` before calling in the live path to prevent stale cached results from freezing the display.
+`evaluate_spectrogram` sets `nfft = round(sample_rate / frequency_resolution)` internally. To guarantee `spg.shape == (channels, rows, nfft)`, pass `frequency_resolution = sample_rate / nfft` and `duration = rows * nfft / sample_rate`.
+
+The calibrated web backend snaps the requested FFT size to a multiple of 28 (see `aligned_nfft` / `ALIGNED_NFFTS` in `striqt_web_server.py`) so `window_fill = 15/28` yields an integer zero-fill; the value is also a multiple of 12 for consistent bin-averaging. (Note: the old advice to clear `striqt_shared.spectrogram_cache` "to prevent a frozen display" was a myth — the cache is disabled by default and never enabled by the live path, so the `.clear()` calls are no-ops. See `AUDIT_REPORT.md` §4-Q1.)
 
 ## Web viewer setup (Cloudflare Tunnel for internet access)
 
