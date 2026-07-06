@@ -93,6 +93,14 @@
             </select>
         </label>
 
+        <label>Analysis
+            <select id="analysis-sel">
+                <option value="spectrogram" selected>Spectrogram</option>
+                <option value="psd">PSD</option>
+                <option value="ssb">SSB spectrogram</option>
+            </select>
+        </label>
+
         <label class="pro-only">Window (ms)
             <select id="win-sel">
                 <option value="10">10</option>
@@ -135,6 +143,26 @@
     </div>
 
 </div><!-- #controls -->
+
+<section class="panel pro-only" id="settings-panel">
+    <div class="panel-head">
+        <h2>Capture settings</h2>
+        <div class="legend-key">
+            <label class="file-label">Load JSON <input type="file" id="settings-upload" accept="application/json,.json"></label>
+            <button id="settings-apply" type="button">Apply</button>
+        </div>
+    </div>
+    <div id="settings-editor">
+        <div class="settings-col">
+            <h3>Capture</h3>
+            <div id="capture-settings-form" class="settings-grid"></div>
+        </div>
+        <div class="settings-col">
+            <h3>Source <span class="reconnect-badge">requires reconnect</span></h3>
+            <div id="source-settings-form" class="settings-grid"></div>
+        </div>
+    </div>
+</section>
 
 <!-- ── Main dashboard ────────────────────────────────────────────────────── -->
 <main id="dashboard">

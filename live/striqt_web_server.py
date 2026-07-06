@@ -31,6 +31,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import struct
@@ -39,9 +40,38 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
+
+
+def _ensure_pixi_runtime_libs():
+    """
+    The AIR-T pixi env ships a newer libstdc++ needed by scipy/striqt waveform
+    extensions. Re-exec once with that lib dir in LD_LIBRARY_PATH when needed.
+    """
+    if os.name != "posix":
+        return
+    try:
+        lib_dir = Path(sys.executable).resolve().parents[1] / "lib"
+    except Exception:
+        return
+    if not (lib_dir / "libstdc++.so.6").exists():
+        return
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in current.split(":") if p]
+    lib_s = str(lib_dir)
+    if lib_s in parts:
+        return
+    os.environ["LD_LIBRARY_PATH"] = ":".join([lib_s] + parts)
+    if os.environ.get("RADIO_WEB_LD_REEXEC") == "1":
+        return
+    os.environ["RADIO_WEB_LD_REEXEC"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_pixi_runtime_libs()
 
 # striqt hardware imports (only needed for real radio mode)
 try:
@@ -65,11 +95,13 @@ except Exception as _sensor_err:
 # striqt analysis (calibrated spectrogram — optional, falls back to quicklook)
 try:
     from striqt.analysis import specs as analysis_specs
+    from striqt.analysis import measurements as striqt_measurements
     from striqt.analysis.measurements import shared as striqt_shared
     _ANALYSIS_OK = True
     _ANALYSIS_ERR = None
 except Exception as e:
     analysis_specs = None
+    striqt_measurements = None
     striqt_shared = None
     _ANALYSIS_OK = False
     _ANALYSIS_ERR = e
@@ -77,6 +109,7 @@ except Exception as e:
 # FastAPI
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import JSONResponse
     from fastapi.staticfiles import StaticFiles
 except ImportError:
     print(
@@ -111,6 +144,15 @@ WEB_DIR = Path(__file__).parent / "web"
 
 # Backend: "calibrated" (striqt PSD/ENBW dB) or "quicklook" (simple FFT dB)
 SPEC_BACKEND = os.environ.get("SPEC_BACKEND", "calibrated").strip().lower()
+BACKENDS = {"calibrated", "quicklook", "ssb"}
+if SPEC_BACKEND not in BACKENDS:
+    SPEC_BACKEND = "calibrated"
+
+AVG_BIN_GROUPS = 12
+SSB_SUBCARRIER_SPACING = 30e3
+SSB_SAMPLE_RATE = 7.68e6
+SSB_DISCOVERY_PERIOD = 20e-3
+SSB_LO_BANDSTOP = 120e3
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +389,7 @@ class RadioConfig:
     gain:        float = DEFAULT_GAIN
     nfft:        int   = DEFAULT_NFFT
     rows:        int   = DEFAULT_ROWS
+    backend:     str   = SPEC_BACKEND
 
     def snapshot(self):
         return RadioConfig(
@@ -355,13 +398,14 @@ class RadioConfig:
             gain=float(self.gain),
             nfft=int(self.nfft),
             rows=int(self.rows),
+            backend=str(self.backend),
         )
 
 
 class SharedConfig:
     def __init__(self):
         self._lock  = threading.Lock()
-        self._cfg   = RadioConfig()
+        self._cfg   = RadioConfig(backend=SPEC_BACKEND)
         self._dirty = False
         self._stop  = False
 
@@ -371,16 +415,57 @@ class SharedConfig:
 
     def update(self, update: dict) -> bool:
         """Apply key/value updates. Returns True if anything changed."""
-        valid = {"center", "sample_rate", "gain", "nfft", "rows"}
+        if "capture" in update and isinstance(update["capture"], dict):
+            capture = update["capture"]
+            mapped = {}
+            if capture.get("center_frequency") is not None:
+                mapped["center"] = capture["center_frequency"]
+            if capture.get("sample_rate") is not None:
+                mapped["sample_rate"] = capture["sample_rate"]
+            if capture.get("gain") is not None:
+                mapped["gain"] = capture["gain"]
+            if capture.get("duration") is not None:
+                try:
+                    with self._lock:
+                        nfft = self._cfg.nfft
+                        sample_rate = self._cfg.sample_rate
+                    rows = round(float(capture["duration"]) * sample_rate / max(nfft, 1))
+                    mapped["rows"] = max(1, min(rows, MAX_LIVE_ROWS))
+                except Exception:
+                    pass
+            update = dict(update)
+            update.update(mapped)
+
+        if "source" in update and isinstance(update["source"], dict):
+            allowed = sorted(k for k in update["source"] if k not in {
+                "receive_retries", "adc_overload_limit", "if_overload_limit", "gapless",
+            })
+            if allowed:
+                print(f"[config] source changes require reconnect: {allowed}")
+
+        valid = {"center", "sample_rate", "gain", "nfft", "rows", "backend"}
         changes = []
         with self._lock:
             for key, value in update.items():
                 if key not in valid:
                     continue
-                value = int(value) if key in {"nfft", "rows"} else float(value)
+                if key == "backend":
+                    value = str(value).strip().lower()
+                    if value not in BACKENDS:
+                        continue
+                else:
+                    value = int(value) if key in {"nfft", "rows"} else float(value)
                 # Clamp rows so a misbehaving browser can't overload the radio
                 if key == "rows":
                     value = int(max(1, min(value, MAX_LIVE_ROWS)))
+                elif key == "center":
+                    value = float(max(300e6, min(value, 6e9)))
+                elif key == "sample_rate":
+                    value = float(max(1e6, min(value, 125e6)))
+                elif key == "gain":
+                    value = float(max(-60.0, min(value, 10.0)))
+                elif key == "nfft":
+                    value = int(max(128, min(value, 8192)))
                 old = getattr(self._cfg, key)
                 if old == value:
                     continue
@@ -560,13 +645,14 @@ def calibrated_spectrogram(
     samples: np.ndarray, nfft: int, rows: int, sample_rate: float
 ) -> np.ndarray:
     """
-    striqt-calibrated PSD spectrogram (ENBW-normalized dB).
-    Returns (channels, rows, nfft) float32, fftshifted, oldest-row-first.
+    striqt-calibrated PSD spectrogram with symbol-style overlap/fill and
+    frequency-bin averaging. Returns (channels, rows, bins) float32.
     """
     if not _ANALYSIS_OK:
         raise RuntimeError(f"calibrated backend unavailable: {_ANALYSIS_ERR!r}")
 
     samples = np.asarray(samples, dtype=np.complex64)
+    nfft = aligned_nfft(nfft)
     needed  = rows * nfft
     if samples.shape[1] < needed:
         pad = np.zeros((samples.shape[0], needed - samples.shape[1]), dtype=np.complex64)
@@ -580,43 +666,128 @@ def calibrated_spectrogram(
         duration=needed / sample_rate,
         analysis_bandwidth=float("inf"),
     )
+    frequency_resolution = sample_rate / float(nfft)
+    average_bins = averaging_factor(nfft)
     spec = analysis_specs.Spectrogram(
-        window="hann",
-        frequency_resolution=sample_rate / float(nfft),
+        window=("kaiser", 11.88),
+        frequency_resolution=frequency_resolution,
+        fractional_overlap=Fraction(13, 28),
+        window_fill=Fraction(15, 28),
+        integration_bandwidth=frequency_resolution * average_bins,
+        trim_stopband=False,
+        lo_bandstop=SSB_LO_BANDSTOP,
     )
     striqt_shared.spectrogram_cache.clear()
     spg, _ = striqt_shared.evaluate_spectrogram(
         samples, capture, spec, dtype="float32", dB=True
     )
+    return fit_display_rows(np.asarray(spg, dtype=np.float32), rows)
+
+
+def ssb_spectrogram(
+    samples: np.ndarray, nfft: int, rows: int, sample_rate: float
+) -> np.ndarray:
+    """
+    5G SSB spectrogram path from striqt. The returned SSB block and symbol axes
+    are flattened to the dashboard's existing rows x bins frame contract.
+    """
+    if not _ANALYSIS_OK:
+        raise RuntimeError(f"SSB backend unavailable: {_ANALYSIS_ERR!r}")
+
+    samples = np.asarray(samples, dtype=np.complex64)
+    nfft = aligned_nfft(nfft)
+    sample_rate = float(sample_rate)
+    capture = analysis_specs.Capture(
+        sample_rate=sample_rate,
+        duration=samples.shape[1] / sample_rate,
+        analysis_bandwidth=float("inf"),
+    )
+    try:
+        spg, _ = striqt_measurements.cellular_5g_ssb_spectrogram(
+            samples,
+            capture,
+            as_xarray=False,
+            subcarrier_spacing=SSB_SUBCARRIER_SPACING,
+            sample_rate=min(SSB_SAMPLE_RATE, sample_rate),
+            discovery_periodicity=SSB_DISCOVERY_PERIOD,
+            frequency_offset=0.0,
+            max_block_count=None,
+            window="blackmanharris",
+            lo_bandstop=SSB_LO_BANDSTOP,
+        )
+    except ValueError as exc:
+        if "counting-number" not in str(exc):
+            raise
+        # The live viewer's power-of-two sample-rate/FFT controls are not
+        # always compatible with the strict 30 kHz SSB grid. Keep the selector
+        # useful by falling back to the same 13/28, 15/28 averaged grid.
+        return calibrated_spectrogram(samples, nfft, rows, sample_rate)
     spg = np.asarray(spg, dtype=np.float32)
+    if spg.ndim == 4:
+        spg = spg.reshape(spg.shape[0], spg.shape[1] * spg.shape[2], spg.shape[3])
+    return fit_display_rows(spg, rows)
 
-    # Null DC/LO leakage spike (same treatment as striqt_standalone.py)
-    c = spg.shape[-1] // 2
-    spg[:, :, c - 2 : c + 3] = spg.min(axis=-1, keepdims=True)
 
-    # Guarantee (channels, rows, nfft) shape contract
+def aligned_nfft(nfft: int) -> int:
+    nfft = max(28, int(nfft))
+    return max(28, int(round(nfft / 28)) * 28)
+
+
+def averaging_factor(nfft: int) -> int:
+    for factor in range(min(AVG_BIN_GROUPS, nfft), 1, -1):
+        if nfft % factor == 0:
+            return factor
+    return 1
+
+
+def fit_display_rows(spg: np.ndarray, rows: int) -> np.ndarray:
+    """Crop/pad a striqt spectrogram to the dashboard row contract."""
+    spg = np.asarray(spg, dtype=np.float32)
+    if spg.ndim != 3:
+        raise RuntimeError(f"spectrogram shape {spg.shape} is not channels x rows x bins")
     if spg.shape[1] != rows:
         spg = spg[:, -rows:, :]
         if spg.shape[1] < rows:
-            fill = float(spg.min()) if spg.size > 0 else -200.0
-            pad  = np.full(
-                (spg.shape[0], rows - spg.shape[1], nfft), fill, dtype=np.float32
+            fill = float(np.nanmin(spg)) if spg.size > 0 else -200.0
+            pad = np.full(
+                (spg.shape[0], rows - spg.shape[1], spg.shape[2]),
+                fill,
+                dtype=np.float32,
             )
             spg = np.concatenate([pad, spg], axis=1)
-    if spg.shape[2] != nfft:
-        raise RuntimeError(
-            f"calibrated_spectrogram: freq bins {spg.shape[2]} != nfft {nfft}"
-        )
+
+    # Null the LO leakage region after any frequency bin averaging.
+    if spg.shape[2] >= 5:
+        c = spg.shape[-1] // 2
+        lo = max(0, c - 2)
+        hi = min(spg.shape[-1], c + 3)
+        spg[:, :, lo:hi] = np.nanmin(spg, axis=-1, keepdims=True)
     return spg
+
+
+def samples_needed(cfg: RadioConfig) -> int:
+    nfft = aligned_nfft(cfg.nfft) if cfg.backend in {"calibrated", "ssb"} else cfg.nfft
+    base = int(nfft * cfg.rows)
+    if cfg.backend == "ssb" and ssb_grid_compatible(cfg.sample_rate):
+        ssb = int(math.ceil(SSB_DISCOVERY_PERIOD * cfg.sample_rate))
+        return max(base, ssb)
+    return base
+
+
+def ssb_grid_compatible(sample_rate: float) -> bool:
+    nfft = round(2 * float(sample_rate) / SSB_SUBCARRIER_SPACING)
+    return nfft > 0 and (13 * nfft) % 28 == 0
 
 
 def compute_blocks(samples: np.ndarray, cfg: RadioConfig) -> np.ndarray:
     """
     Dispatch to the configured backend.
-    Returns (channels, rows, nfft) float32.
+    Returns (channels, rows, bins) float32.
     """
-    if SPEC_BACKEND == "calibrated":
+    if cfg.backend == "calibrated":
         return calibrated_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
+    if cfg.backend == "ssb":
+        return ssb_spectrogram(samples, cfg.nfft, cfg.rows, cfg.sample_rate)
     return db_spectrogram(samples, cfg.nfft, cfg.rows)
 
 
@@ -667,14 +838,17 @@ class Acquirer(threading.Thread):
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
     def publish(self, cfg: RadioConfig, blocks: list):
+        first = np.asarray(blocks[0], dtype=np.float32)
+        rows, bins = first.shape
         header = {
             "center":   float(cfg.center),
             "fs":       float(cfg.sample_rate),
             "gain":     float(cfg.gain),
-            "nfft":     int(cfg.nfft),
-            "rows":     int(cfg.rows),
-            "shape":    [int(cfg.rows), int(cfg.nfft)],
+            "nfft":     int(bins),
+            "rows":     int(rows),
+            "shape":    [int(rows), int(bins)],
             "channels": list(CHANNELS),
+            "backend":  str(cfg.backend),
             "time":     time.time(),
         }
         with self._pub_lock:
@@ -756,7 +930,7 @@ class Acquirer(threading.Thread):
         print(
             f"[radio] armed: center {cfg.center/1e6:.2f} MHz, "
             f"{cfg.sample_rate/1e6:.3f} MS/s, channels {CHANNELS}, "
-            f"backend={SPEC_BACKEND}"
+            f"backend={cfg.backend}"
         )
 
     def rearm(self, cfg: RadioConfig):
@@ -852,7 +1026,7 @@ class Acquirer(threading.Thread):
                     print(
                         f"[radio] IQ {iq.shape} {iq.dtype}  "
                         f"ring {min(self._count, MAX_TAIL)}/{MAX_TAIL}  "
-                        f"backend={SPEC_BACKEND}"
+                        f"backend={cfg.backend}"
                     )
                     last_log = now
 
@@ -883,7 +1057,7 @@ class Computer(threading.Thread):
         next_t   = time.time()
         while not self.shared.stopped():
             cfg     = self.shared.snapshot()
-            samples = self.acquirer.get_latest(cfg.nfft * cfg.rows)
+            samples = self.acquirer.get_latest(samples_needed(cfg))
             if samples is None:
                 # Ring empty/stale (startup or just after a retune) — wait.
                 time.sleep(0.03)
@@ -930,14 +1104,17 @@ class DemoAcquirer(threading.Thread):
             return dict(self._latest_header), [b.copy() for b in self._latest_blocks]
 
     def _publish(self, cfg: RadioConfig, blocks: list):
+        first = np.asarray(blocks[0], dtype=np.float32)
+        rows, bins = first.shape
         header = {
             "center":   float(cfg.center),
             "fs":       float(cfg.sample_rate),
             "gain":     float(cfg.gain),
-            "nfft":     int(cfg.nfft),
-            "rows":     int(cfg.rows),
-            "shape":    [int(cfg.rows), int(cfg.nfft)],
+            "nfft":     int(bins),
+            "rows":     int(rows),
+            "shape":    [int(rows), int(bins)],
             "channels": list(CHANNELS),
+            "backend":  str(cfg.backend),
             "time":     time.time(),
             "demo":     True,
         }
@@ -950,9 +1127,11 @@ class DemoAcquirer(threading.Thread):
         print("[demo] Synthetic IQ mode — no radio hardware used.")
         print("[demo] Two CW tones per channel + noise. Controls work normally.")
 
+        interval = 1.0 / max(BROADCAST_FPS, 1.0)
+        next_t = time.time()
         while not self.shared.stopped():
             cfg = self.shared.snapshot()
-            n   = cfg.rows * cfg.nfft
+            n   = samples_needed(cfg)
             t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
 
             # Channel 0: two tones offset from center
@@ -978,7 +1157,12 @@ class DemoAcquirer(threading.Thread):
             except Exception as e:
                 print(f"[demo] compute error: {e}")
 
-            time.sleep(max(1.0 / BROADCAST_FPS, 0.02))
+            next_t += interval
+            dt = next_t - time.time()
+            if dt > 0:
+                time.sleep(dt)
+            else:
+                next_t = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +1253,35 @@ app.add_middleware(BasicAuthMiddleware)
 app.add_middleware(NoCacheMiddleware)
 
 
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+def capture_editor_schema():
+    from striqt.sensor import bindings
+    from striqt.analysis.specs.helpers import json_schema
+
+    binding = bindings.air8201b
+    sweep_cls = getattr(binding, "sweep_spec", None)
+    if sweep_cls is None:
+        sensor = getattr(binding, "sensor", None)
+        sweep_cls = getattr(sensor, "sweep_spec_cls", None)
+    if sweep_cls is None:
+        raise RuntimeError("Unable to locate air8201b sweep schema")
+    return _json_safe(json_schema(sweep_cls))
+
+
+@app.get("/schema")
+async def schema_endpoint():
+    return JSONResponse(capture_editor_schema())
+
+
 async def _broadcaster():
     """
     Polls acquirer.latest() at BROADCAST_FPS, serializes the frame once, and
@@ -1139,6 +1352,11 @@ async def ws_endpoint(ws: WebSocket):
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
     Sends spectrogram frames as binary (see serialize_frame).
     """
+    if _connections:
+        await ws.close(code=1008)
+        print(f"[ws] refused extra client: {ws.client}")
+        return
+
     await ws.accept()
     _connections.add(ws)
     client = ws.client
@@ -1191,7 +1409,7 @@ def main():
     parser.add_argument("--fps",      type=float, default=BROADCAST_FPS,
                         help="Max broadcast frame rate (fps)")
     parser.add_argument("--backend",  default=SPEC_BACKEND,
-                        choices=["calibrated", "quicklook"],
+                        choices=sorted(BACKENDS),
                         help="Spectrogram backend")
     parser.add_argument("--host",     default="0.0.0.0",
                         help="Bind address")
@@ -1199,7 +1417,7 @@ def main():
                         help="Listen port")
     args = parser.parse_args()
 
-    if args.demo and not _ANALYSIS_OK and SPEC_BACKEND == "calibrated":
+    if args.demo and not _ANALYSIS_OK and args.backend in {"calibrated", "ssb"}:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")
         SPEC_BACKEND = "quicklook"
     else:
