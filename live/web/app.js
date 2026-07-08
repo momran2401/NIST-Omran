@@ -1,15 +1,15 @@
 /**
  * app.js — striqt WebSocket live viewer
  *
- * Connects to /ws, receives binary spectrogram frames, renders two waterfall
- * canvases + an overlaid PSD chart (uPlot), and sends radio control messages
- * back to the server.
+ * Connects to /ws, receives binary spectrogram frames, renders one waterfall
+ * canvas per channel (the set follows the frame header, P3-4) + an overlaid
+ * PSD chart (uPlot), and sends radio control messages back to the server.
  *
  * Wire format (binary WebSocket message, server → browser):
  *   [4-byte LE uint32 : JSON header byte length]
  *   [JSON header bytes]
  *   [block-0 raw bytes]   rows×nfft float32-LE (or uint8 with "scale" header)
- *   [block-1 raw bytes]
+ *   [block-1 raw bytes]   … one block per header channel
  *
  * Control message (text JSON, browser → server):
  *   { center, sample_rate, gain, nfft, rows }   (any subset of these keys)
@@ -56,19 +56,69 @@ let serverStats = null;     // header psd_stats — statistic behind each block 
 let curSpanMs   = null;     // header time_span_ms — true integrated span
 let uplotKind   = "std";    // which uPlot layout is built: "std" | "psd:<stats>"
 
-// Per-channel display buffers [rows_displayed × nfft], newest row at index 0
-const wfBuf   = { 0: null, 1: null };
+// Active channel list from the frame header (P3-4). null until ensureChannels
+// runs; the display index i (RX label, colors) is the position in this list,
+// the value is the server-side port number used to key the buffers below.
+let channelList = null;
+
+// Per-channel display buffers [rows_displayed × nfft], newest row at index 0.
+// Keys are channel numbers; entries are (re)created by ensureChannels.
+const wfBuf   = {};
 // Peak-hold and min-trace per channel (Float32Array of length nfft)
-const holdBuf = { 0: null, 1: null };
-const minBuf  = { 0: null, 1: null };
+const holdBuf = {};
+const minBuf  = {};
 // Last raw PSD data (mean+max per channel) for exports and band monitor
 const psdData = {
-    mean: { 0: null, 1: null },
-    max:  { 0: null, 1: null },
+    mean: {},
+    max:  {},
     // PSD backend (P2b-4): server statistic traces
-    // { stats: [...], traces: {0: [Float32Array per stat], 1: [...]} }
+    // { stats: [...], traces: {ch: [Float32Array per stat], …} }
     server: null,
 };
+
+// Null every per-channel entry of the given buffer objects (mode/analysis
+// switches and hold/min clears — replaces the old fixed  buf[0]=buf[1]=null).
+function clearChannelBufs(...bufs) {
+    for (const b of bufs) {
+        for (const k of Object.keys(b)) b[k] = null;
+    }
+}
+
+function channelsKey(list) {
+    return list.join(",");
+}
+
+// Device identity (P3-5): the server ships its device label in every frame
+// header ("device") and in /config (device.label). The page title, brand
+// heading, and subtitle follow it; a cheap key check skips the DOM writes on
+// the (typical) unchanged frame.
+let curDevice = null;        // raw device label, e.g. "AIR8201B"
+let deviceLabelKey = null;   // "<label>|<nchannels>" of the last DOM update
+
+function updateDeviceLabel(label) {
+    if (!label) return;
+    const n = channelList ? channelList.length : null;
+    const key = `${label}|${n}`;
+    if (deviceLabelKey === key) return;
+    deviceLabelKey = key;
+    curDevice = label;
+    document.title = `${label} Live Spectrogram + PSD`;
+    const h1 = document.querySelector("#app-header .brand-text h1");
+    if (h1) h1.textContent = `${label} Live Viewer`;
+    const sub = document.querySelector("#app-header .brand-text p");
+    if (sub) {
+        const rx = n === 1 ? "single receiver"
+                 : n === 2 ? "dual receiver"
+                 : n       ? `${n} receivers`
+                 : null;
+        sub.textContent = rx ? `Spectrogram & PSD · ${rx}` : "Spectrogram & PSD";
+    }
+}
+
+function firstWfBuf() {
+    const chans = channelList || [];
+    return chans.length ? wfBuf[chans[0]] : null;
+}
 
 // FPS counter
 let frameCount  = 0;
@@ -113,7 +163,8 @@ function setStatus(text, cls = "") {
 
 function updateMeta() {
     if (!curBins || !curFs) return;
-    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const buf0 = firstWfBuf();
+    const depthRows = buf0 ? buf0.length / curBins : curRows;
     const winMs     = (depthRows * rowHopSamples() / curFs * 1e3).toFixed(0);
     const mode      = replaceMode ? "flicker" : "waterfall";
     const scale     = autoColor ? "auto" : "manual";
@@ -129,6 +180,7 @@ function updateMeta() {
         ? `integration ${curSpanMs.toFixed(0)} ms (${serverStats.map(statLabel).join("/")})`
         : `window ${winMs} ms (${depthRows} rows)`;
     metaEl.textContent = (
+        (curDevice ? `${curDevice} | ` : "") +
         `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
         `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
         `FFT ${fftLabel} | ${analysis} | ${mode} | ${winLabel} | ` +
@@ -314,6 +366,10 @@ function onFrame(data) {
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
             backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg,
             hop_size, psd_stats, time_span_ms } = header;
+    // (Re)build the per-channel panes/buffers when the header's channel set
+    // differs from the current display (P3-4) — a no-op on every other frame.
+    ensureChannels(channels);
+    updateDeviceLabel(header.device);
     let offset = 4 + hdrLen;
 
     // ── Parse blocks ──────────────────────────────────────────────────────
@@ -372,8 +428,7 @@ function onFrame(data) {
         freqsMHz  = buildFreqsMHz(center, fs, nfft, absRF, curF0, curStep);
         updateSsbOption();
         // Clear hold/min on tuning change (freq-axis specific)
-        holdBuf[0] = holdBuf[1] = null;
-        minBuf[0]  = minBuf[1]  = null;
+        clearChannelBufs(holdBuf, minBuf);
         uplotKind = null;   // force the renderer below to rebuild the right plot
         resetBand(freqsMHz);
     }
@@ -386,7 +441,8 @@ function onFrame(data) {
         renderServerPsd(channels, blocks, rows, nfft);
     } else {
         psdData.server = null;
-        if (uplotKind !== "std") initUplot(freqsMHz);
+        const stdKind = "std:" + channelsKey(channelList);
+        if (uplotKind !== stdKind) initUplot(freqsMHz);
         for (const ch of channels) {
             updateWaterfall(ch, blocks[ch], rows, nfft, center, fs);
         }
@@ -409,15 +465,75 @@ function onFrame(data) {
 // Waterfall rendering
 // ---------------------------------------------------------------------------
 
-const wfCanvas = {
-    0: document.getElementById("wf0"),
-    1: document.getElementById("wf1"),
-};
-const wfCtx = {
-    0: wfCanvas[0].getContext("2d"),
-    1: wfCanvas[1].getContext("2d"),
-};
-const wfImageData = { 0: null, 1: null };
+// Canvas maps are populated by ensureChannels (P3-4), which clones the
+// #wf-pane-tpl template once per header channel.
+let wfCanvas    = {};
+let wfCtx       = {};
+let wfImageData = {};
+
+// Per-channel trace/dot colors. Indices 0/1 are the historical RX1/RX2 colors
+// verbatim (so the two-channel AIR-T view is pixel-identical); 2+ cycle
+// distinct hues for future multi-channel devices.
+const CH_COLORS = [
+    { mean: "#4ea3ff", max: "#ff5252", hold: "rgba(255,82,82,0.45)",
+      min: "rgba(78,163,255,0.6)",   dot: "#4ea3ff" },
+    { mean: "#9ac8ff", max: "#ff9a9a", hold: "rgba(255,154,154,0.45)",
+      min: "rgba(154,200,255,0.6)",  dot: "#9ac8ff" },
+    { mean: "#ffb74d", max: "#ba68c8", hold: "rgba(186,104,200,0.45)",
+      min: "rgba(255,183,77,0.6)",   dot: "#ffb74d" },
+    { mean: "#4db6ac", max: "#f06292", hold: "rgba(240,98,146,0.45)",
+      min: "rgba(77,182,172,0.6)",   dot: "#4db6ac" },
+];
+function chColors(i) {
+    return CH_COLORS[i % CH_COLORS.length];
+}
+
+// Build (or rebuild) the per-channel display: one waterfall pane per header
+// channel, fresh buffers, and a forced uPlot rebuild. No-op when the channel
+// set is unchanged — the common case, checked with a cheap string compare.
+function ensureChannels(channels) {
+    const list = (channels && channels.length) ? Array.from(channels) : [0];
+    if (channelList && channelsKey(channelList) === channelsKey(list)) return;
+    channelList = list;
+
+    const row = document.getElementById("waterfall-row");
+    const tpl = document.getElementById("wf-pane-tpl");
+    row.textContent = "";
+    wfCanvas = {}; wfCtx = {}; wfImageData = {};
+    clearChannelBufs(wfBuf, holdBuf, minBuf, psdData.mean, psdData.max);
+
+    channelList.forEach((ch, i) => {
+        const pane = tpl.content.firstElementChild.cloneNode(true);
+        pane.id = `wf-pane-${ch}`;
+        const dot = pane.querySelector(".dot");
+        dot.style.background = chColors(i).dot;
+        dot.style.boxShadow  = `0 0 6px ${chColors(i).dot}`;
+        pane.querySelector(".wf-title-text").textContent =
+            `Spectrogram Port ${ch} — RX${i + 1}`;
+        const canvas = pane.querySelector("canvas");
+        canvas.id = `wf${ch}`;
+        row.appendChild(pane);
+        wfCanvas[ch]    = canvas;
+        wfCtx[ch]       = canvas.getContext("2d");
+        wfImageData[ch] = null;
+        wfBuf[ch] = holdBuf[ch] = minBuf[ch] = null;
+        psdData.mean[ch] = psdData.max[ch] = null;
+    });
+    // Column count via a custom property so the max-width:1000px media query
+    // (grid-template-columns: 1fr) still wins on small screens.
+    row.style.setProperty("--wf-cols", String(channelList.length));
+
+    // The RX1−RX2 diff trace only exists with exactly two channels.
+    if (channelList.length !== 2) showDiff = false;
+    const diffChk = document.getElementById("diff-chk");
+    if (diffChk) {
+        const label = diffChk.closest("label");
+        if (label) label.style.display = channelList.length === 2 ? "" : "none";
+        if (channelList.length !== 2) diffChk.checked = false;
+    }
+
+    uplotKind = null;   // series set depends on the channel list — rebuild
+}
 
 function computeDisplayDepth(rows, nfft, fs) {
     if (replaceMode) return rows;
@@ -496,7 +612,8 @@ function renderWfAxis() {
         const i = Math.round((k / 4) * (n - 1));
         spans += `<span>${freqsMHz[i].toFixed(1)} MHz</span>`;
     }
-    const depthRows = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const buf0 = firstWfBuf();
+    const depthRows = buf0 ? buf0.length / curBins : curRows;
     const winMs = (depthRows * rowHopSamples() / curFs * 1e3).toFixed(0);
     spans += `<span class="wf-axis-win">↕ ${winMs} ms</span>`;
     divs.forEach((d) => { d.innerHTML = spans; });
@@ -509,19 +626,9 @@ function renderWfAxis() {
 const PSD_BG    = "#0e1726";
 const PSD_FG    = "#8b97a8";
 
-// PSD trace palette — mean traces are bluish, max traces are reddish (channels
-// distinguished by light/dark shade of the same hue family).
-const COL = {
-    rx1Mean: "#4ea3ff",   // RX1 mean — azure
-    rx2Mean: "#9ac8ff",   // RX2 mean — light blue
-    rx1Max:  "#ff5252",   // RX1 max  — red
-    rx2Max:  "#ff9a9a",   // RX2 max  — light red
-    rx1Hold: "rgba(255,82,82,0.45)",
-    rx2Hold: "rgba(255,154,154,0.45)",
-    rx1Min:  "rgba(78,163,255,0.6)",
-    rx2Min:  "rgba(154,200,255,0.6)",
-    diff:    "#e6e9ef",
-};
+// Per-channel PSD trace colors live in CH_COLORS (P3-4); only the two-channel
+// difference trace keeps a dedicated color.
+const DIFF_COL = "#e6e9ef";
 
 // PSD y-axis label depends on the backend: calibrated/ssb values are band-
 // integrated over one averaged bin (~+8.5 dB vs per-bin); quicklook is per-bin.
@@ -537,10 +644,34 @@ function initUplot(freqs) {
 
     const w = document.getElementById("psd-container").clientWidth || 900;
 
+    // Series set follows the channel list (P3-4). Order for two channels is
+    // the historical layout exactly: mean/max per channel, then holds, then
+    // mins, then the RX1−RX2 diff (which only exists with two channels).
+    const chans  = channelList || [0, 1];
+    const rxName = (i) => `RX${i + 1}`;
+    const series = [{}];   // x (freqs)
+    chans.forEach((ch, i) => {
+        series.push({ label: `${rxName(i)} Mean`, stroke: chColors(i).mean,
+                      width: 2, show: true });
+        series.push({ label: `${rxName(i)} Max`,  stroke: chColors(i).max,
+                      width: 2, show: true });
+    });
+    chans.forEach((ch, i) => {
+        series.push({ label: `${rxName(i)} Hold`, stroke: chColors(i).hold,
+                      width: 1, dash: [4, 4], show: false });
+    });
+    chans.forEach((ch, i) => {
+        series.push({ label: `${rxName(i)} Min`,  stroke: chColors(i).min,
+                      width: 1, dash: [2, 4], show: false });
+    });
+    if (chans.length === 2) {
+        series.push({ label: "RX1−RX2", stroke: DIFF_COL, width: 2, show: false });
+    }
+
     const opts = {
         width:  w,
         height: 300,
-        title:  "Power Spectral Density (RX1 + RX2)",
+        title:  `Power Spectral Density (${chans.map((c, i) => rxName(i)).join(" + ")})`,
         background: PSD_BG,
         cursor: {
             show:  true,
@@ -564,22 +695,7 @@ function initUplot(freqs) {
                 font:   "11px Menlo,monospace",
             },
         ],
-        series: [
-            {},   // x (freqs)
-            { label: "RX1 Mean", stroke: COL.rx1Mean, width: 2, show: true  },
-            { label: "RX1 Max",  stroke: COL.rx1Max,  width: 2, show: true  },
-            { label: "RX2 Mean", stroke: COL.rx2Mean, width: 2, show: true  },
-            { label: "RX2 Max",  stroke: COL.rx2Max,  width: 2, show: true  },
-            { label: "RX1 Hold", stroke: COL.rx1Hold, width: 1,
-              dash: [4, 4], show: false },
-            { label: "RX2 Hold", stroke: COL.rx2Hold, width: 1,
-              dash: [4, 4], show: false },
-            { label: "RX1 Min",  stroke: COL.rx1Min,  width: 1,
-              dash: [2, 4], show: false },
-            { label: "RX2 Min",  stroke: COL.rx2Min,  width: 1,
-              dash: [2, 4], show: false },
-            { label: "RX1−RX2",  stroke: COL.diff,    width: 2,    show: false },
-        ],
+        series,
         hooks: {
             draw: [drawPsdOverlays],
         },
@@ -589,9 +705,10 @@ function initUplot(freqs) {
     // Each y-series must be an array the same length as the x-axis. uPlot reads
     // data[i].length on every series, so a bare null throws at construction —
     // initialize with all-null arrays (rendered as gaps) until the first frame.
-    const empty  = Array.from({ length: 9 }, () => new Array(nfft).fill(null));
+    const empty  = Array.from({ length: series.length - 1 },
+                              () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
-    uplotKind = "std";
+    uplotKind = "std:" + channelsKey(chans);
 
     // Preserve the crosshair toggle across re-inits (a retune rebuilds the plot,
     // which would otherwise silently reset the cursor to "on") — LV-R9a.
@@ -622,8 +739,8 @@ function statLabel(stat) {
 }
 
 // Trace colors: mean stays the blue family, max the red family (matching the
-// classic pair); other statistics cycle a distinct palette. Index 0 = RX1
-// (saturated), 1 = RX2 (light shade of the same hue).
+// classic pair); other statistics cycle a distinct palette. Per statistic the
+// two shades alternate over the channel index (0 = saturated, 1 = light).
 const STAT_COLS = {
     mean: ["#4ea3ff", "#9ac8ff"],
     max:  ["#ff5252", "#ff9a9a"],
@@ -652,24 +769,25 @@ function initUplotPsdStats(freqs, stats) {
     const container = document.getElementById("psd-plot");
     container.innerHTML = "";
     const w = document.getElementById("psd-container").clientWidth || 900;
-    const cols = statColors(stats);
+    const cols = stats ? statColors(stats) : [];
+    const chans = channelList || [0, 1];
 
     const series = [{}];
-    for (const ch of [0, 1]) {
+    chans.forEach((ch, c) => {
         stats.forEach((s, i) => {
             series.push({
-                label:  `RX${ch + 1} ${statLabel(s)}`,
-                stroke: cols[i][ch],
+                label:  `RX${c + 1} ${statLabel(s)}`,
+                stroke: cols[i][c % cols[i].length],
                 width:  2,
                 show:   true,
             });
         });
-    }
+    });
 
     const opts = {
         width:  w,
         height: 300,
-        title:  "Power Spectral Density — striqt statistics (RX1 + RX2)",
+        title:  `Power Spectral Density — striqt statistics (${chans.map((_, i) => `RX${i + 1}`).join(" + ")})`,
         background: PSD_BG,
         cursor: {
             show:  true,
@@ -698,7 +816,7 @@ function initUplotPsdStats(freqs, stats) {
     const empty = Array.from({ length: series.length - 1 },
                              () => new Array(nfft).fill(null));
     uplot = new uPlot(opts, [Array.from(freqs), ...empty], container);
-    uplotKind = "psd:" + stats.join(",");
+    uplotKind = "psd:" + channelsKey(chans) + ":" + stats.join(",");
 
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
@@ -708,15 +826,17 @@ function initUplotPsdStats(freqs, stats) {
 function renderServerPsd(channels, blocks, rows, nfft) {
     if (!freqsMHz || !serverStats) return;
     const stats = serverStats;
-    const kind  = "psd:" + stats.join(",");
+    const chans = channelList || [0, 1];
+    const kind  = "psd:" + channelsKey(chans) + ":" + stats.join(",");
     if (!uplot || uplotKind !== kind) initUplotPsdStats(freqsMHz, stats);
 
     const nStats  = Math.min(stats.length, rows);
     const freqArr = Array.from(freqsMHz);
     const gaps    = new Array(nfft).fill(null);
     const data    = [freqArr];
-    const traces  = { 0: [], 1: [] };
-    for (const ch of [0, 1]) {
+    const traces  = {};
+    for (const ch of chans) {
+        traces[ch] = [];
         const block = blocks[ch];
         for (let s = 0; s < stats.length; s++) {
             if (!block || s >= nStats) {
@@ -737,10 +857,7 @@ function renderServerPsd(channels, blocks, rows, nfft) {
     if (peakMarker) {
         let idx = stats.findIndex((s) => String(s).toLowerCase() === "max");
         if (idx < 0) idx = stats.length - 1;
-        peakMarkerData = {
-            rx1: bestBin(traces[0][idx], freqArr),
-            rx2: bestBin(traces[1][idx], freqArr),
-        };
+        peakMarkerData = chans.map((ch) => bestBin(traces[ch][idx], freqArr));
     }
     applyYspan();
 }
@@ -751,9 +868,9 @@ function psdSeries(channels, blocks, rows, nfft) {
      * (not just the latest frame), so the PSD reflects the same window
      * that's shown in the waterfall.
      */
-    const mean = {}, max = {}, min = {}, diff = null;
+    const mean = {}, max = {}, min = {};
 
-    for (const ch of [0, 1]) {
+    for (const ch of (channelList || [])) {
         const buf = wfBuf[ch];
         if (!buf) continue;
         const depth = buf.length / nfft;
@@ -790,10 +907,13 @@ function psdSeries(channels, blocks, rows, nfft) {
 function updatePSD(channels, blocks, rows, nfft) {
     if (!uplot || !freqsMHz) return;
 
+    const chans = channelList || [0, 1];
+    const twoCh = chans.length === 2;
+    const diffActive = twoCh && showDiff;
     const { mean, max, min } = psdSeries(channels, blocks, rows, nfft);
 
     // Update peak hold
-    for (const ch of [0, 1]) {
+    for (const ch of chans) {
         if (!max[ch]) continue;
         if (peakHold) {
             if (!holdBuf[ch] || holdBuf[ch].length !== nfft) {
@@ -820,46 +940,46 @@ function updatePSD(channels, blocks, rows, nfft) {
     // Never hand uPlot a bare null series — it reads data[i].length. Any series
     // that is toggled off or not yet available becomes a length-nfft array of
     // nulls, which uPlot renders as gaps (drawing nothing).
+    // Data/vis order mirrors initUplot's series order exactly: mean/max per
+    // channel, then holds, then mins, then (two channels only) the diff.
     const gaps = new Array(nfft).fill(null);
-    let s1m = mean[0] ? Array.from(mean[0]) : gaps;
-    let s1x = max[0]  ? Array.from(max[0])  : gaps;
-    let s2m = mean[1] ? Array.from(mean[1]) : gaps;
-    let s2x = max[1]  ? Array.from(max[1])  : gaps;
-    let h1  = (peakHold && holdBuf[0]) ? Array.from(holdBuf[0]) : gaps;
-    let h2  = (peakHold && holdBuf[1]) ? Array.from(holdBuf[1]) : gaps;
-    let n1  = (showMin  && minBuf[0])  ? Array.from(minBuf[0])  : gaps;
-    let n2  = (showMin  && minBuf[1])  ? Array.from(minBuf[1])  : gaps;
-    let dif = (showDiff && mean[0] && mean[1])
-            ? Array.from(mean[0]).map((v, i) => v - mean[1][i]) : gaps;
+    const data = [freqArr];
+    const vis  = [true];
+    for (const ch of chans) {
+        data.push(mean[ch] ? Array.from(mean[ch]) : gaps);
+        data.push(max[ch]  ? Array.from(max[ch])  : gaps);
+        vis.push(!diffActive, !diffActive);
+    }
+    for (const ch of chans) {
+        data.push((peakHold && holdBuf[ch]) ? Array.from(holdBuf[ch]) : gaps);
+        vis.push(peakHold && !diffActive);
+    }
+    for (const ch of chans) {
+        data.push((showMin && minBuf[ch]) ? Array.from(minBuf[ch]) : gaps);
+        vis.push(showMin && !diffActive);
+    }
+    if (twoCh) {
+        const m0 = mean[chans[0]], m1 = mean[chans[1]];
+        data.push((diffActive && m0 && m1)
+            ? Array.from(m0).map((v, i) => v - m1[i]) : gaps);
+        vis.push(diffActive);
+    }
 
-    // Series order: freqs, mean0, max0, mean1, max1, hold0, hold1, min0, min1, diff
-    uplot.setData([freqArr, s1m, s1x, s2m, s2x, h1, h2, n1, n2, dif]);
-
-    // Show/hide series
-    const vis = [
-        true,
-        !showDiff, !showDiff,     // mean/max RX1
-        !showDiff, !showDiff,     // mean/max RX2
-        peakHold && !showDiff,
-        peakHold && !showDiff,
-        showMin  && !showDiff,
-        showMin  && !showDiff,
-        showDiff,                  // diff
-    ];
+    uplot.setData(data);
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
     // Peak markers (strongest bin per visible channel) — LV-U1b
-    if (peakMarker && !showDiff) {
-        drawPeakMarker(s1x, s2x, freqArr);
+    if (peakMarker && !diffActive) {
+        peakMarkerData = chans.map((ch) => bestBin(max[ch] || null, freqArr));
     }
 
     // Fixed Y-span
     applyYspan();
 }
 
-// Peak markers: computed here, drawn each frame via uPlot's redraw hook. One per
-// channel (RX1/RX2 max traces), so the label is no longer RX1-only (LV-U1b).
-let peakMarkerData = null;
+// Peak markers: computed per frame, drawn via uPlot's redraw hook. One entry
+// per channel (display order matches channelList) — LV-U1b / P3-4.
+let peakMarkerData = null;   // null | array of ({freq, power} | null)
 function bestBin(arr, freqArr) {
     if (!arr) return null;
     let bestI = 0;
@@ -868,9 +988,6 @@ function bestBin(arr, freqArr) {
     }
     const v = arr[bestI];
     return (v === null || v === undefined) ? null : { freq: freqArr[bestI], power: v };
-}
-function drawPeakMarker(s1x, s2x, freqArr) {
-    peakMarkerData = { rx1: bestBin(s1x, freqArr), rx2: bestBin(s2x, freqArr) };
 }
 
 // uPlot draw hook — overlays: peak marker, band selection
@@ -896,8 +1013,7 @@ function drawPsdOverlays(u) {
             ctx.font      = "bold 11px Menlo,monospace";
             ctx.fillText(`${tag} ${pm.freq.toFixed(3)} MHz  ${pm.power.toFixed(1)} dB`, px + 8, py - 5);
         };
-        drawOne(peakMarkerData.rx1, COL.rx1Max, "RX1");
-        drawOne(peakMarkerData.rx2, COL.rx2Max, "RX2");
+        peakMarkerData.forEach((pm, i) => drawOne(pm, chColors(i).max, `RX${i + 1}`));
     }
 
     // ── Band selection region ─────────────────────────────────────────────
@@ -972,8 +1088,9 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
     }
     const nBins = hiIdx - loIdx + 1;
 
+    const chans = channelList || [0, 1];
     const band = {}, qual = {};
-    for (const ch of [0, 1]) {
+    for (const ch of chans) {
         // PSD backend (P2b-4): no waterfall window — integrate the mean trace
         // (or the first statistic) instead of the display buffer.
         let buf = null, depth = 0;
@@ -1007,11 +1124,17 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
     }
 
     const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${nBins} bins)`];
-    if (band[0] !== undefined) segs.push(`RX1 ${band[0].toFixed(1)} dB`);
-    if (band[1] !== undefined) segs.push(`RX2 ${band[1].toFixed(1)} dB`);
-    if (band[0] !== undefined && band[1] !== undefined) {
-        segs.push(`Δ ${(band[0] - band[1]).toFixed(1)} dB`);
-        segs.push(`Q RX1 ${qual[0] >= 0 ? "+" : ""}${qual[0].toFixed(1)} RX2 ${qual[1] >= 0 ? "+" : ""}${qual[1].toFixed(1)} dB`);
+    chans.forEach((ch, i) => {
+        if (band[ch] !== undefined) segs.push(`RX${i + 1} ${band[ch].toFixed(1)} dB`);
+    });
+    // Channel delta / relative quality only make sense as a pair — shown with
+    // exactly two channels (the classic AIR-T RX1/RX2 view).
+    if (chans.length === 2) {
+        const [a, b] = chans;
+        if (band[a] !== undefined && band[b] !== undefined) {
+            segs.push(`Δ ${(band[a] - band[b]).toFixed(1)} dB`);
+            segs.push(`Q RX1 ${qual[a] >= 0 ? "+" : ""}${qual[a].toFixed(1)} RX2 ${qual[b] >= 0 ? "+" : ""}${qual[b].toFixed(1)} dB`);
+        }
     }
     bandMonitorEl.textContent = segs.join("   |   ");
 }
@@ -1109,13 +1232,14 @@ function setupBandDrag() {
 function savePsdCsv() {
     // PSD backend (P2b-4): export the server statistic traces, one column per
     // (channel, statistic).
+    const chans = channelList || [0, 1];
     if (psdData.server && freqsMHz) {
         const { stats, traces } = psdData.server;
         const nfft = freqsMHz.length;
         const cols = [];
-        for (const ch of [0, 1]) {
-            for (const s of stats) cols.push(`rx${ch + 1}_${statLabel(s).toLowerCase()}_db`);
-        }
+        chans.forEach((ch, i) => {
+            for (const s of stats) cols.push(`rx${i + 1}_${statLabel(s).toLowerCase()}_db`);
+        });
         const rows = [
             `# backend=psd`,
             `# fft_nfft=${curFftNfft}`,
@@ -1126,7 +1250,7 @@ function savePsdCsv() {
         ];
         for (let i = 0; i < nfft; i++) {
             const vals = [];
-            for (const ch of [0, 1]) {
+            for (const ch of chans) {
                 for (let s = 0; s < stats.length; s++) {
                     const tr = traces[ch] ? traces[ch][s] : null;
                     vals.push(tr ? tr[i].toFixed(3) : "");
@@ -1142,24 +1266,27 @@ function savePsdCsv() {
         logMsg("PSD statistics CSV saved");
         return;
     }
-    if (!freqsMHz || !psdData.mean[0]) {
+    if (!freqsMHz || !psdData.mean[chans[0]]) {
         logMsg("No PSD data yet — try again after the first frame", "WARN");
         return;
     }
     const nfft = freqsMHz.length;
+    const cols = [];
+    chans.forEach((ch, i) => cols.push(`rx${i + 1}_mean_db`, `rx${i + 1}_max_db`));
     const rows = [
         `# backend=${curBackend}`,
         `# fft_nfft=${curFftNfft}`,
         `# bin_avg=${curBinAvg}`,
         `# units=dB (uncalibrated, ${curBackend === "quicklook" ? "per-bin" : "band-integrated"})`,
-        "freq_mhz,rx1_mean_db,rx1_max_db,rx2_mean_db,rx2_max_db",
+        "freq_mhz," + cols.join(","),
     ];
     for (let i = 0; i < nfft; i++) {
-        const m0 = psdData.mean[0] ? psdData.mean[0][i].toFixed(3) : "";
-        const x0 = psdData.max[0]  ? psdData.max[0][i].toFixed(3)  : "";
-        const m1 = psdData.mean[1] ? psdData.mean[1][i].toFixed(3) : "";
-        const x1 = psdData.max[1]  ? psdData.max[1][i].toFixed(3)  : "";
-        rows.push(`${freqsMHz[i].toFixed(6)},${m0},${x0},${m1},${x1}`);
+        const vals = [];
+        for (const ch of chans) {
+            vals.push(psdData.mean[ch] ? psdData.mean[ch][i].toFixed(3) : "");
+            vals.push(psdData.max[ch]  ? psdData.max[ch][i].toFixed(3)  : "");
+        }
+        rows.push(`${freqsMHz[i].toFixed(6)},${vals.join(",")}`);
     }
     const blob = new Blob([rows.join("\n")], { type: "text/csv" });
     const a    = document.createElement("a");
@@ -1170,25 +1297,32 @@ function savePsdCsv() {
 }
 
 function exportPng() {
-    // Composite the two waterfalls side by side, then the PSD below
-    const c0 = wfCanvas[0], c1 = wfCanvas[1];
+    // Composite the waterfalls side by side (one per channel), then the PSD below
+    const chans    = channelList || [];
+    const canvases = chans.map((ch) => wfCanvas[ch]).filter(Boolean);
     const psdCanvas = uplot ? uplot.root.querySelector("canvas") : null;
 
-    const W  = Math.max((c0.width + c1.width), psdCanvas ? psdCanvas.width : 0);
-    const H  = Math.max(c0.height, c1.height) + (psdCanvas ? psdCanvas.height : 0) + 30;
+    const wfW = canvases.reduce((sum, c) => sum + c.width, 0);
+    const wfH = canvases.reduce((m, c) => Math.max(m, c.height), 0);
+    const W  = Math.max(wfW, psdCanvas ? psdCanvas.width : 0);
+    const H  = wfH + (psdCanvas ? psdCanvas.height : 0) + 30;
     const out = document.createElement("canvas");
     out.width  = W;
     out.height = H;
     const ctx = out.getContext("2d");
     ctx.fillStyle = "#0e1726";
     ctx.fillRect(0, 0, W, H);
-    ctx.drawImage(c0, 0, 0);
-    ctx.drawImage(c1, c0.width, 0);
-    if (psdCanvas) ctx.drawImage(psdCanvas, 0, Math.max(c0.height, c1.height));
+    let x = 0;
+    for (const c of canvases) {
+        ctx.drawImage(c, x, 0);
+        x += c.width;
+    }
+    if (psdCanvas) ctx.drawImage(psdCanvas, 0, wfH);
 
     // Settings caption
     const ts  = new Date().toLocaleString();
-    const capDepth = wfBuf[0] ? wfBuf[0].length / curBins : curRows;
+    const buf0 = firstWfBuf();
+    const capDepth = buf0 ? buf0.length / curBins : curRows;
     const capWinMs = (capDepth * rowHopSamples() / curFs * 1e3).toFixed(0);
     const capFft   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}→${curFftNfft}`;
     const cap = `${ts}  center ${(curCenter / 1e6).toFixed(3)} MHz  span ${(curFs / 1e6).toFixed(2)} MS/s  FFT ${capFft}  window ${capWinMs} ms`;
@@ -1228,9 +1362,7 @@ function applyAnalysisMode() {
                   : analysisMode === "quicklook" ? "quicklook"
                   : analysisMode === "psd" ? "psd"
                   : "calibrated";
-    wfBuf[0] = wfBuf[1] = null;
-    holdBuf[0] = holdBuf[1] = null;
-    minBuf[0] = minBuf[1] = null;
+    clearChannelBufs(wfBuf, holdBuf, minBuf);
     sendControl({ backend });
     // Swap the Analysis panel to the selected analysis' parameter set (P2b-6).
     if (typeof renderAnalysisPanel === "function") renderAnalysisPanel();
@@ -1263,7 +1395,7 @@ pauseBtn.addEventListener("click", () => {
 document.getElementById("mode-sel").addEventListener("change", (e) => {
     replaceMode = e.target.value === "replace";
     // Clear display buffers so mode switch starts clean
-    wfBuf[0] = wfBuf[1] = null;
+    clearChannelBufs(wfBuf);
     sendTimeControl();
 });
 
@@ -1346,17 +1478,17 @@ document.getElementById("peak-chk").addEventListener("change", (e) => {
 
 document.getElementById("hold-chk").addEventListener("change", (e) => {
     peakHold = e.target.checked;
-    if (!peakHold) { holdBuf[0] = holdBuf[1] = null; }
+    if (!peakHold) clearChannelBufs(holdBuf);
 });
 
 document.getElementById("clear-hold-btn").addEventListener("click", () => {
-    holdBuf[0] = holdBuf[1] = null;
+    clearChannelBufs(holdBuf);
     logMsg("Peak hold cleared");
 });
 
 document.getElementById("min-chk").addEventListener("change", (e) => {
     showMin = e.target.checked;
-    if (!showMin) { minBuf[0] = minBuf[1] = null; }
+    if (!showMin) clearChannelBufs(minBuf);
 });
 
 document.getElementById("cross-chk").addEventListener("change", (e) => {
@@ -1525,6 +1657,7 @@ async function fetchConfig() {
 }
 
 function seedStaticControls(config) {
+    if (config && config.device) updateDeviceLabel(config.device.label);
     const cap = (config && config.capture) || {};
     if (cap.nfft) {
         radioNfft = cap.nfft;   // /config re-sync — the other radioNfft updater
@@ -1552,10 +1685,27 @@ function seedStaticControls(config) {
 
 function seedCaptureForm(config) {
     const cap = (config && config.capture) || {};
+    // Device capability envelope (P3-5): display-only min/max attributes +
+    // tooltips on the live radio knobs. The server's freedom-model clamps
+    // remain authoritative — an out-of-range entry is still sent and comes
+    // back as a "rounded" ack; these hints just make the range visible.
+    const env = (config && config.envelope) || null;
+    const hints = env ? {
+        center_frequency: [env.freq_min, env.freq_max, "Hz"],
+        gain:             [env.gain_min, env.gain_max, "dB"],
+        sample_rate:      [env.rate_min, env.rate_max, "S/s"],
+    } : null;
     document.querySelectorAll("#capture-settings-form input, #capture-settings-form select")
         .forEach((input) => {
             const name = input.dataset.field;
             if (name in cap) setFieldValue(input, cap[name]);
+            const hint = hints && hints[name];
+            if (hint && input.tagName === "INPUT" && input.type === "number") {
+                const [lo, hi, unit] = hint;
+                if (lo !== undefined && lo !== null) input.min = lo;
+                if (hi !== undefined && hi !== null) input.max = hi;
+                input.title = `device range: ${lo} – ${hi} ${unit}`;
+            }
         });
 }
 
@@ -1776,6 +1926,10 @@ renderAnalysisPanel();
 // Default band to middle 10% of span (reset once we have freq data)
 bandLo = -curFs / 1e6 * 0.05;
 bandHi =  curFs / 1e6 * 0.05;
+
+// Build the default two-pane layout before the first frame arrives (the
+// classic AIR-T view); the first header rebuilds it if the device differs.
+ensureChannels([0, 1]);
 
 // Init PSD with placeholder data so layout is in place
 freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);

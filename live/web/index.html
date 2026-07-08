@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
-    <title>AIR8201 Live Spectrogram + PSD</title>
+    <!-- Neutral fallbacks — app.js replaces these with the active device's
+         label + channel count from the frame header / config (P3-5). -->
+    <title>Live Spectrogram + PSD</title>
     <link rel="stylesheet" href="style.css">
     <!-- uPlot: fast canvas charting for the PSD plot. CDN; can be vendored. -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
@@ -16,8 +18,8 @@
     <div class="brand">
         <span class="brand-mark"></span>
         <div class="brand-text">
-            <h1>AIR8201 Live Viewer</h1>
-            <p>Spectrogram &amp; PSD · dual receiver</p>
+            <h1>Live Viewer</h1>
+            <p>Spectrogram &amp; PSD</p>
         </div>
     </div>
 
@@ -190,23 +192,19 @@
         <div id="band-monitor">Band monitor: --</div>
     </section>
 
-    <!-- Waterfalls -->
-    <section id="waterfall-row">
-        <div class="wf-pane" id="wf-pane-0">
-            <div class="wf-title"><span class="dot dot-rx1"></span>Spectrogram Port 0 — RX1</div>
+    <!-- Waterfalls — one pane per channel, cloned from the template by
+         app.js ensureChannels() so the layout follows the frame header's
+         channel list (P3-4). -->
+    <section id="waterfall-row"></section>
+    <template id="wf-pane-tpl">
+        <div class="wf-pane">
+            <div class="wf-title"><span class="dot"></span><span class="wf-title-text"></span></div>
             <div class="wf-wrap">
-                <canvas class="wf-canvas" id="wf0"></canvas>
+                <canvas class="wf-canvas"></canvas>
                 <div class="wf-freq-axis"></div>
             </div>
         </div>
-        <div class="wf-pane" id="wf-pane-1">
-            <div class="wf-title"><span class="dot dot-rx2"></span>Spectrogram Port 1 — RX2</div>
-            <div class="wf-wrap">
-                <canvas class="wf-canvas" id="wf1"></canvas>
-                <div class="wf-freq-axis"></div>
-            </div>
-        </div>
-    </section>
+    </template>
 
     <!-- PSD plot -->
     <section class="panel" id="psd-row">

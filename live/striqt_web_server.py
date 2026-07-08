@@ -79,6 +79,10 @@ try:
     from striqt.sensor import specs
     from striqt.sensor.lib.sources.deepwave import Air8201BSourceSpec, Airstack1Source
     try:
+        from striqt.sensor.lib.sources.soapy import SoapySource as _SoapySource
+    except Exception:
+        _SoapySource = None
+    try:
         from striqt.sensor.lib.sources.soapy import ReceiveStreamError
     except Exception:
         try:
@@ -91,6 +95,7 @@ except Exception as _sensor_err:
     specs = None
     Air8201BSourceSpec = None
     Airstack1Source = None
+    _SoapySource = None
     ReceiveStreamError = OSError
 
 # striqt analysis (calibrated spectrogram — optional, falls back to quicklook)
@@ -124,6 +129,65 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Device profiles (P3-1). One entry per supported SDR; data only — the source
+# factories live in make_source(). DEVICE/DEVICE_LABEL/CHANNELS are resolved
+# once in main() from --device, before any thread or SharedConfig exists;
+# every later read is runtime, so set-once is safe. Default stays air8201b so
+# a bare launch on the Jetson is byte-identical to Phase 2b.
+#
+#   channels        RX port tuple the acquirer streams
+#   defaults        RadioConfig seeds (center / sample_rate / gain)
+#   envelope        capability fallback: tier-1 clamp bounds (P3-3)
+#   query_envelope  True → ask the live SoapySDR device for its real ranges
+#                   after open and merge them over the fallback. False for
+#                   air8201b/demo: their fallback IS today's exact clamp
+#                   numbers (the −60..10 gain window is a striqt calibrated-
+#                   gain convention, not the raw SoapyAIRT range — querying
+#                   would shift legal bounds on the existing deployment).
+# ---------------------------------------------------------------------------
+
+DEVICE_PROFILES = {
+    "air8201b": {
+        "label": "AIR8201B",
+        "channels": (0, 1),
+        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 300e6, "freq_max": 6e9,
+            "gain_min": -60.0, "gain_max": 10.0,
+            "rate_min": 1e6,   "rate_max": 125e6,
+        },
+        "query_envelope": False,
+    },
+    "pluto": {
+        "label": "PlutoSDR",
+        "channels": (0,),
+        # 3.84 MS/s default: sustained 15.36 MS/s over the Pluto's USB link is
+        # optimistic; start on the safe LTE grid point and let the user go up.
+        "defaults": {"center": 1955e6, "sample_rate": 3.84e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 325e6,  "freq_max": 3.8e9,
+            "gain_min": 0.0,    "gain_max": 73.0,
+            "rate_min": 0.52e6, "rate_max": 61.44e6,
+        },
+        "query_envelope": True,
+    },
+    "demo": {
+        "label": "Demo (synthetic IQ)",
+        "channels": (0, 1),
+        "defaults": {"center": 1955e6, "sample_rate": 15.36e6, "gain": 0.0},
+        "envelope": {
+            "freq_min": 300e6, "freq_max": 6e9,
+            "gain_min": -60.0, "gain_max": 10.0,
+            "rate_min": 1e6,   "rate_max": 125e6,
+        },
+        "query_envelope": False,
+    },
+}
+
+DEVICE       = "air8201b"
+DEVICE_LABEL = DEVICE_PROFILES[DEVICE]["label"]
+
 CHANNELS = (0, 1)
 
 DEFAULT_CENTER      = 1955e6
@@ -153,9 +217,31 @@ RING_ROW_FILL       = 0.9       # fraction of MAX_TAIL usable for one frame's ne
 RATES_HZ      = (3.84e6, 7.68e6, 15.36e6, 30.72e6)
 NFFT_CHOICES  = (256, 512, 1024, 2048, 4096)
 
+# Demo tone plan (P3-2): per-channel CW tone sets of (amplitude, offset_hz),
+# cycled when the demo runs with more channels than entries. Entries 0/1 are
+# the historical two-channel tone sets, unchanged.
+DEMO_TONES = (
+    ((0.30,  2.5e6), (0.12, -1.8e6)),
+    ((0.20, -3.2e6), (0.08,  4.1e6)),
+    ((0.25,  1.1e6), (0.10, -4.6e6)),
+    ((0.15, -0.9e6), (0.09,  3.3e6)),
+)
+
 
 def _snap(value, choices):
     return min(choices, key=lambda c: abs(c - value))
+
+
+def allowed_rates(env):
+    """
+    LTE-grid rates within the device capability envelope (P3-3). The grid is
+    domain logic (cellular multiples of 1.92 MHz), not a device property; the
+    envelope only filters it. Falls back to the full grid if the intersection
+    is empty so snapping never faces an empty choice list.
+    """
+    rates = tuple(r for r in RATES_HZ
+                  if env["rate_min"] <= r <= env["rate_max"])
+    return rates or RATES_HZ
 
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -897,7 +983,20 @@ class RadioConfig:
 class SharedConfig:
     def __init__(self):
         self._lock  = threading.Lock()
-        self._cfg   = RadioConfig(backend=SPEC_BACKEND)
+        # Seed the radio knobs from the active device profile (P3-1). For
+        # air8201b/demo the profile defaults equal the DEFAULT_* constants,
+        # so behaviour is unchanged there.
+        _prof = DEVICE_PROFILES[DEVICE]["defaults"]
+        self._cfg   = RadioConfig(
+            backend=SPEC_BACKEND,
+            center=_prof["center"],
+            sample_rate=_prof["sample_rate"],
+            gain=_prof["gain"],
+        )
+        # Capability envelope (P3-3): tier-1 clamp bounds. Starts as the
+        # profile fallback; when the profile opts in (query_envelope) the
+        # Acquirer merges the live device's queried ranges over it after open.
+        self._envelope = dict(DEVICE_PROFILES[DEVICE]["envelope"])
         self._dirty = False
         self._stop  = False
         # P2a-3 backstop state: the analysis params of the last config that
@@ -917,6 +1016,29 @@ class SharedConfig:
     def snapshot(self):
         with self._lock:
             return self._cfg.snapshot()
+
+    # --- Capability envelope (P3-3) -------------------------------------------
+
+    def set_envelope(self, env: dict):
+        """Merge queried device bounds over the profile fallback. Partial
+        dicts are fine — unanswered keys keep their fallback values."""
+        clean = {}
+        for key, value in (env or {}).items():
+            if key not in self._envelope or value is None:
+                continue
+            try:
+                clean[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            return
+        with self._lock:
+            self._envelope.update(clean)
+        print(f"[device] capability envelope updated: {clean}")
+
+    def envelope(self):
+        with self._lock:
+            return dict(self._envelope)
 
     # --- Compute backstop (P2a-3) ---------------------------------------------
 
@@ -1012,10 +1134,13 @@ class SharedConfig:
         mapped to the top level by the capture branch), not the stale cfg.
         """
         eff = self.snapshot()
+        env = self.envelope()
         try:
             if update.get("sample_rate") is not None:
                 eff.sample_rate = float(
-                    max(1e6, min(_snap(float(update["sample_rate"]), RATES_HZ), 125e6))
+                    max(env["rate_min"],
+                        min(_snap(float(update["sample_rate"]), allowed_rates(env)),
+                            env["rate_max"]))
                 )
             if update.get("nfft") is not None:
                 eff.nfft = int(_snap(int(update["nfft"]), NFFT_CHOICES))
@@ -1546,6 +1671,10 @@ class SharedConfig:
         } | ANALYSIS_CFG_KEYS
         changes = []
         with self._lock:
+            # Device capability bounds for this message's clamps (P3-3).
+            # Read directly — self._lock is already held (envelope() would
+            # re-take it).
+            env = self._envelope
             # Effective backend/SCS for THIS message: an SSB-grid rate (e.g. the
             # retuned 13.44 MS/s coming back from a server-seeded form) must not
             # be snapped onto the LTE list only for the SSB retune to undo it —
@@ -1604,14 +1733,14 @@ class SharedConfig:
                 if key == "rows":
                     value = int(max(1, min(value, max_live_rows(self._cfg))))
                 elif key == "center":
-                    value = float(max(300e6, min(value, 6e9)))
+                    value = float(max(env["freq_min"], min(value, env["freq_max"])))
                 elif key == "sample_rate":
                     value = float(value)
                     if not (eff_backend == "ssb" and ssb_grid_compatible(value, eff_scs)):
-                        value = float(_snap(value, RATES_HZ))
-                    value = float(max(1e6, min(value, 125e6)))
+                        value = float(_snap(value, allowed_rates(env)))
+                    value = float(max(env["rate_min"], min(value, env["rate_max"])))
                 elif key == "gain":
-                    value = float(max(-60.0, min(value, 10.0)))
+                    value = float(max(env["gain_min"], min(value, env["gain_max"])))
                 elif key == "nfft":
                     value = int(_snap(value, NFFT_CHOICES))
                     value = int(max(128, min(value, 8192)))
@@ -1795,12 +1924,96 @@ def stream_buffers_for(source, samples):
     return [samples[CHANNELS.index(p)].view(np.float32) for p in ports], ports
 
 
+def query_device_envelope(source):
+    """
+    Ask the open SoapySDR device for its real capability ranges (P3-3).
+    Returns a partial envelope dict — only the keys the device answered — to
+    be merged over the profile fallback by SharedConfig.set_envelope. Every
+    step is defensive: a missing method, failed call, or odd range-object
+    shape just drops that key (the fallback bound stays in force).
+    """
+    dev = get_device(source)
+    if dev is None:
+        return {}
+    try:
+        from SoapySDR import SOAPY_SDR_RX as _rx_dir
+    except Exception:
+        _rx_dir = 1   # SoapySDR's RX direction constant
+    ch = CHANNELS[0] if CHANNELS else 0
+
+    def _bounds(ranges):
+        lows, highs = [], []
+        for r in ranges:
+            try:
+                lows.append(float(r.minimum()))
+                highs.append(float(r.maximum()))
+            except Exception:
+                try:
+                    lows.append(float(r[0]))
+                    highs.append(float(r[1]))
+                except Exception:
+                    pass
+        if lows and highs:
+            return min(lows), max(highs)
+        return None
+
+    env = {}
+    for method, lo_key, hi_key in (
+        ("getFrequencyRange",  "freq_min", "freq_max"),
+        ("getGainRange",       "gain_min", "gain_max"),
+        ("getSampleRateRange", "rate_min", "rate_max"),
+    ):
+        fn = getattr(dev, method, None)
+        if fn is None:
+            continue
+        try:
+            ranges = fn(_rx_dir, ch)
+        except Exception:
+            continue
+        if not isinstance(ranges, (list, tuple)):
+            ranges = [ranges]   # getGainRange returns a single Range object
+        got = _bounds(ranges)
+        if got:
+            env[lo_key], env[hi_key] = got
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Source / capture factories
 # ---------------------------------------------------------------------------
 
-def make_source():
-    source_spec = Air8201BSourceSpec(
+if _SENSOR_OK and _SoapySource is not None:
+    class PlutoSource(Airstack1Source):
+        """
+        PlutoSDR adapter (ported from live/pluto_standalone.py, P3-1).
+
+        Subclasses Airstack1Source to reuse all of its striqt stream/arm/read
+        machinery, but overrides __init__ to call SoapySource.__init__ directly.
+        This skips two things in Airstack1Source.__init__ that crash on a Pluto:
+          1. driver='SoapyAIRT'  -- replaced with driver='plutosdr'
+          2. _set_jesd_sysref_delay()  -- AIR-T FPGA register write, absent on Pluto
+        get_id/read_peripherals are overridden because the AirStack versions read
+        the Jetson eth0 MAC and an AirStack-only temperature sensor.
+        striqt/ itself is never modified.
+        """
+
+        def __init__(self, spec, **kwargs):
+            _SoapySource.__init__(self, spec, driver="plutosdr", **kwargs)
+
+        def get_id(self):
+            try:
+                return self.device.getHardwareKey()
+            except Exception:
+                return "pluto"
+
+        def read_peripherals(self):
+            return {}
+else:
+    PlutoSource = None
+
+
+def _make_source_spec():
+    return Air8201BSourceSpec(
         master_clock_rate=MASTER_CLOCK_RATE,
         array_backend="numpy",
         time_source="host",
@@ -1809,7 +2022,62 @@ def make_source():
         gapless=True,
         receive_retries=0,
     )
+
+
+def make_source():
+    # Device dispatch (P3-1). The pluto path reuses the AIR8201B spec values —
+    # proven by the standalone POC; the plutosdr Soapy driver ignores the
+    # AirStack master-clock/time-source fields it doesn't implement.
+    source_spec = _make_source_spec()
+    if DEVICE == "pluto":
+        if PlutoSource is None:
+            raise RuntimeError("striqt SoapySource unavailable — cannot drive a PlutoSDR")
+        source = PlutoSource(source_spec)
+        source.setup()
+        return source
     return Airstack1Source.from_spec(source_spec)
+
+
+def _resolve_auto_device():
+    """--device auto: enumerate SoapySDR, pick the single supported radio."""
+    try:
+        import SoapySDR
+    except Exception as e:
+        print(f"ERROR: --device auto needs SoapySDR (import failed: {e})",
+              file=sys.stderr)
+        sys.exit(1)
+    driver_to_device = {"SoapyAIRT": "air8201b", "plutosdr": "pluto"}
+    try:
+        results = SoapySDR.Device.enumerate()
+    except Exception as e:
+        print(f"ERROR: SoapySDR enumeration failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    found = []
+    for r in results:
+        try:
+            info = dict(r)
+        except Exception:
+            info = {}
+        name = driver_to_device.get(str(info.get("driver", "")))
+        if name:
+            found.append((name, info))
+    if len(found) == 1:
+        name, info = found[0]
+        label = info.get("label") or info.get("driver") or name
+        print(f"[device] auto-detected {name} ({label})")
+        return name
+    print(
+        f"ERROR: --device auto found {len(found)} supported radios "
+        f"(need exactly 1). Enumeration:",
+        file=sys.stderr,
+    )
+    for r in results:
+        try:
+            print(f"  {dict(r)}", file=sys.stderr)
+        except Exception:
+            print(f"  {r}", file=sys.stderr)
+    print("  Pick one explicitly: --device air8201b | pluto | demo", file=sys.stderr)
+    sys.exit(1)
 
 def make_capture(cfg):
     # port stays fixed at CHANNELS — the two-waterfall UI depends on both RX ports
@@ -2471,6 +2739,7 @@ def build_header(cfg: RadioConfig, blocks: list, meta: dict, demo: bool = False)
         "rows":          int(rows),
         "shape":         [int(rows), int(bins)],
         "channels":      list(CHANNELS),
+        "device":        DEVICE_LABEL,
         "backend":       executed,
         "fft_nfft":      fft_nfft,
         "bin_avg":       bin_avg,
@@ -2629,6 +2898,15 @@ class Acquirer(threading.Thread):
         enable_stream(self.source, True)
         self.stream_mtu   = get_stream_mtu(self.source)
         self.stream_ports = get_stream_ports(self.source)
+        # Capability envelope (P3-3): profiles that opt in get their tier-1
+        # clamp bounds from the live device. Failure is non-fatal — the
+        # profile fallback stays in force. _recover() reopens through here,
+        # so the envelope survives recovery cycles.
+        if DEVICE_PROFILES[DEVICE].get("query_envelope"):
+            try:
+                self.shared.set_envelope(query_device_envelope(self.source))
+            except Exception as e:
+                print(f"[device] envelope query failed (profile fallback kept): {e}")
         print(
             f"[radio] armed: center {cfg.center/1e6:.2f} MHz, "
             f"{cfg.sample_rate/1e6:.3f} MS/s, channels {CHANNELS}, "
@@ -2855,23 +3133,22 @@ class DemoAcquirer(threading.Thread):
             n   = samples_needed(cfg)
             t   = np.arange(n, dtype=np.float32) / cfg.sample_rate
 
-            # Channel 0: two tones offset from center
-            sig0 = (
-                0.30 * np.exp(2j * np.pi *  2.5e6 * t) +
-                0.12 * np.exp(2j * np.pi * -1.8e6 * t)
-            ).astype(np.complex64)
-            noise0 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
-                      ).astype(np.complex64) * 0.04
+            # One tone set + noise per channel (P3-2). The per-channel order
+            # (tones, then that channel's noise draw) matches the old fixed
+            # two-channel code exactly, so the default 2-ch demo is
+            # bit-identical to before.
+            chans = []
+            for i in range(len(CHANNELS)):
+                tones = DEMO_TONES[i % len(DEMO_TONES)]
+                sig = sum(
+                    amp * np.exp(2j * np.pi * offset_hz * t)
+                    for amp, offset_hz in tones
+                ).astype(np.complex64)
+                noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
+                         ).astype(np.complex64) * 0.04
+                chans.append(sig + noise)
 
-            # Channel 1: different tones
-            sig1 = (
-                0.20 * np.exp(2j * np.pi * -3.2e6 * t) +
-                0.08 * np.exp(2j * np.pi *  4.1e6 * t)
-            ).astype(np.complex64)
-            noise1 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)
-                      ).astype(np.complex64) * 0.04
-
-            samples = np.stack([sig0 + noise0, sig1 + noise1])
+            samples = np.stack(chans)
             try:
                 blocks, meta = compute_blocks(samples, cfg)
                 self._publish(cfg, [blocks[i] for i in range(blocks.shape[0])], meta)
@@ -3084,6 +3361,12 @@ def current_config():
             "lo_bandstop":           (float(cfg.ssb_lo_bandstop)
                                       if cfg.ssb_lo_bandstop else None),
         },
+        "device": {
+            "name":     DEVICE,
+            "label":    DEVICE_LABEL,
+            "channels": list(CHANNELS),
+        },
+        "envelope": _shared.envelope(),
         "backend": str(cfg.backend),
         "rows":    int(cfg.rows),
         "lo_null": bool(cfg.lo_null),
@@ -3271,13 +3554,24 @@ else:
 
 def main():
     global _acquirer, _computer, _shared, _quantize, BROADCAST_FPS, SPEC_BACKEND
+    global DEVICE, DEVICE_LABEL, CHANNELS
 
     parser = argparse.ArgumentParser(
         description="striqt WebSocket live viewer server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--device",   default="air8201b",
+                        choices=("air8201b", "pluto", "demo", "auto"),
+                        help="SDR to drive (auto = enumerate SoapySDR, pick the "
+                             "single supported radio)")
     parser.add_argument("--demo",     action="store_true",
-                        help="Use synthetic IQ (no radio hardware)")
+                        help="Use synthetic IQ (no radio hardware); alias for "
+                             "--device demo")
+    # 1-4 channels: the frontend builds its panes/series from the header's
+    # channel list (P3-4); 4 is just a sane demo ceiling, not a hard limit.
+    parser.add_argument("--channels", type=int, default=None, choices=(1, 2, 3, 4),
+                        help="Demo-only channel-count override (real devices "
+                             "use their profile)")
     parser.add_argument("--quantize", action="store_true",
                         help="Encode waterfall as uint8 (~4x smaller frames)")
     parser.add_argument("--fps",      type=float, default=BROADCAST_FPS,
@@ -3291,13 +3585,33 @@ def main():
                         help="Listen port")
     args = parser.parse_args()
 
-    if args.demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
+    # Resolve the device first (P3-1): --demo remains the historical alias and
+    # may not contradict an explicit real --device choice.
+    device = args.device
+    if args.demo:
+        if device not in ("air8201b", "demo"):
+            parser.error(f"--demo conflicts with --device {device}")
+        device = "demo"
+    if device == "auto":
+        device = _resolve_auto_device()
+    DEVICE       = device
+    profile      = DEVICE_PROFILES[DEVICE]
+    DEVICE_LABEL = profile["label"]
+    CHANNELS     = tuple(profile["channels"])
+    is_demo      = DEVICE == "demo"
+    if args.channels is not None:
+        if not is_demo:
+            parser.error("--channels is a demo-only override "
+                         "(real devices use their profile)")
+        CHANNELS = tuple(range(args.channels))
+
+    if is_demo and not _ANALYSIS_OK and args.backend in CALIBRATED_GRID_BACKENDS:
         print("[demo] striqt.analysis unavailable; falling back to quicklook backend")
         SPEC_BACKEND = "quicklook"
     else:
         SPEC_BACKEND = args.backend
 
-    if not args.demo and not _SENSOR_OK:
+    if not is_demo and not _SENSOR_OK:
         print(
             "ERROR: striqt.sensor not importable (radio hardware deps missing).\n"
             "  Run with --demo for synthetic IQ, or install the striqt radio stack.",
@@ -3308,7 +3622,7 @@ def main():
     BROADCAST_FPS = max(args.fps, 0.5)
     _quantize     = args.quantize
     _shared       = SharedConfig()
-    if args.demo:
+    if is_demo:
         # DemoAcquirer generates synthetic IQ and self-publishes — no DMA to
         # overflow, so it keeps the inline-compute path and needs no Computer.
         _acquirer = DemoAcquirer(_shared)
@@ -3326,7 +3640,7 @@ def main():
         )
         sys.exit(1)
 
-    mode    = "DEMO (synthetic IQ)" if args.demo else "AIR8201B radio"
+    mode    = "DEMO (synthetic IQ)" if is_demo else f"{DEVICE_LABEL} radio"
     q_note  = " + uint8 quantization" if _quantize else ""
     print(f"\nstriqt web viewer — {mode}")
     print(f"  backend={SPEC_BACKEND}, fps={BROADCAST_FPS:.0f}{q_note}")

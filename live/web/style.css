@@ -375,7 +375,10 @@ button.active {
 
 #waterfall-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* --wf-cols is set by app.js ensureChannels() to the channel count (P3-4);
+       the max-width media query below still wins on small screens because it
+       overrides grid-template-columns itself, not the custom property. */
+    grid-template-columns: repeat(var(--wf-cols, 2), 1fr);
     gap: var(--gap);
 }
 
@@ -403,9 +406,8 @@ button.active {
     overflow: hidden;
     text-overflow: ellipsis;
 }
+/* Dot colors are set inline per channel by ensureChannels() (P3-4). */
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
-.dot-rx1 { background: var(--mean); box-shadow: 0 0 6px rgba(78,163,255,0.6); }
-.dot-rx2 { background: #9ac8ff; box-shadow: 0 0 6px rgba(154,200,255,0.5); }
 
 .wf-wrap {
     position: relative;

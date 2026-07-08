@@ -2,12 +2,14 @@
 # run_web.sh — Start the striqt web viewer server + Cloudflare Tunnel.
 #
 # Usage:
-#   bash live/run_web.sh             # real AIR8201B radio
-#   bash live/run_web.sh --demo      # synthetic IQ, no hardware
-#   bash live/run_web.sh --quantize  # uint8 waterfall (smaller frames)
+#   bash live/run_web.sh                  # real AIR8201B radio (default device)
+#   bash live/run_web.sh --device pluto   # PlutoSDR host (P3-1)
+#   bash live/run_web.sh --device auto    # enumerate SoapySDR, pick the radio
+#   bash live/run_web.sh --demo           # synthetic IQ, no hardware
+#   bash live/run_web.sh --quantize       # uint8 waterfall (smaller frames)
 #
 # Extra args are passed directly to striqt_web_server.py, so you can combine:
-#   bash live/run_web.sh --demo --fps 10 --quantize
+#   bash live/run_web.sh --demo --fps 10 --quantize --channels 1
 #
 # Requirements:
 #   pip install fastapi 'uvicorn[standard]'
