@@ -59,25 +59,8 @@ h1, h2 { font-weight: 650; }
 
 .brand { display: flex; align-items: center; gap: 11px; flex: 0 0 auto; }
 
-.brand-mark {
-    width: 30px; height: 30px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, var(--mean), #2b6fc4 55%, #1b3a5e);
-    box-shadow: 0 0 0 1px rgba(78,163,255,0.35), 0 6px 16px rgba(78,163,255,0.18);
-    position: relative;
-    flex: 0 0 auto;
-}
-.brand-mark::after {
-    content: "";
-    position: absolute; inset: 7px 6px;
-    background:
-        repeating-linear-gradient(90deg, rgba(255,255,255,0.9) 0 2px, transparent 2px 5px);
-    opacity: 0.55;
-    border-radius: 2px;
-}
-
-.brand-text h1 { font-size: 15px; letter-spacing: 0.01em; line-height: 1.1; }
-.brand-text p  { font-size: 11px; color: var(--text-dim); margin-top: 1px; }
+.brand-text h1 { font-size: 18px; letter-spacing: 0.02em; line-height: 1.1; }
+.brand-text p  { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
 /* Status bar lives in the header now */
 #statusbar {
@@ -114,15 +97,23 @@ h1, h2 { font-weight: 650; }
 .status-pill:has(#status-text.warn)  .status-dot { background: var(--yellow); box-shadow: 0 0 8px rgba(245,215,80,0.6); }
 .status-pill:has(#status-text.error) .status-dot { background: var(--red);    box-shadow: 0 0 8px rgba(255,96,96,0.6); }
 
-#meta-text {
+/* Sign out / switch user button (status bar). Pushed to the far right. */
+#signout-btn {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 4px 12px;
+    background: transparent;
+    border: 1px solid var(--border2);
     color: var(--text-dim);
-    font-family: var(--font-mono);
+    border-radius: 999px;
     font-size: 11px;
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-weight: 600;
+    cursor: pointer;
     white-space: nowrap;
+}
+#signout-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
 }
 
 /* Controls toggle — only visible on small screens */
@@ -371,6 +362,20 @@ button.active {
     white-space: nowrap;
 }
 
+/* ── Applied settings band ────────────────────────────────────────────────── */
+/* Same readout treatment as the band monitor: monospace, single line, scrolls
+   horizontally so the full config string is never clipped. */
+#applied-settings {
+    padding: 10px 12px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-dim);
+    letter-spacing: 0.01em;
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
 /* ── Waterfall row ────────────────────────────────────────────────────────── */
 
 #waterfall-row {
@@ -486,6 +491,20 @@ button.active {
     white-space: pre;
 }
 
+/* Per-line log entries, colored by level (INFO blue / WARN yellow / ERROR red).
+   The tokens match the status-pill states so the log and status agree. */
+.log-line { white-space: pre-wrap; word-break: break-word; }
+.log-info  { color: var(--accent); }
+.log-warn  { color: var(--yellow); }
+.log-error { color: var(--red); }
+
+/* Admin-only affordances (e.g. Reset Radio): hidden until the WS role message
+   marks the session as admin (body.is-admin, set in applyRole). Declared BEFORE
+   the mode rules below so that, at equal specificity, a pro-only admin button
+   still gets hidden by `body.mode-noob .pro-only` in ARIC mode. */
+.admin-only { display: none !important; }
+body.is-admin .admin-only { display: inline-block !important; }
+
 /* ── PRO / NOOB mode ──────────────────────────────────────────────────────── */
 
 body.mode-pro  .noob-only { display: none !important; }
@@ -597,7 +616,7 @@ body.mode-noob .pro-only  { display: none !important; }
         padding: 10px 12px;
     }
     #statusbar { order: 3; width: 100%; flex-basis: 100%; }
-    #meta-text { font-size: 10px; }
+    #applied-settings { font-size: 11px; }
     #ctrl-toggle { display: inline-block; order: 2; margin-left: auto; }
 
     /* Collapsible controls on mobile */

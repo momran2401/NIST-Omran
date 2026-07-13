@@ -113,17 +113,10 @@ function updateDeviceLabel(label) {
     if (deviceLabelKey === key) return;
     deviceLabelKey = key;
     curDevice = label;
-    document.title = `${label} Live Spectrogram + PSD`;
-    const h1 = document.querySelector("#app-header .brand-text h1");
-    if (h1) h1.textContent = `${label} Live Viewer`;
-    const sub = document.querySelector("#app-header .brand-text p");
-    if (sub) {
-        const rx = n === 1 ? "single receiver"
-                 : n === 2 ? "dual receiver"
-                 : n       ? `${n} receivers`
-                 : null;
-        sub.textContent = rx ? `Spectrogram & PSD · ${rx}` : "Spectrogram & PSD";
-    }
+    // The header title is now static ("SDR LIVE Viewer" / NIST) — the device
+    // name and channel count live in the Applied Settings band via updateMeta().
+    // We still set the browser tab title so the device is identifiable there.
+    document.title = `${label} · SDR LIVE Viewer`;
 }
 
 function firstWfBuf() {
@@ -152,12 +145,19 @@ const logPre = document.getElementById("log-pre");
 const MAX_LOG_LINES = 150;
 
 function logMsg(msg, level = "INFO") {
-    const ts   = new Date().toTimeString().slice(0, 8);
-    const line = `[${ts}] ${level.padEnd(5)} ${msg}`;
-    const lines = (logPre.textContent + "\n" + line).split("\n");
-    if (lines.length > MAX_LOG_LINES) lines.splice(0, lines.length - MAX_LOG_LINES);
-    logPre.textContent = lines.join("\n").trimStart();
-    logPre.scrollTop   = logPre.scrollHeight;
+    const ts  = new Date().toTimeString().slice(0, 8);
+    const lvl = String(level).toUpperCase();
+    // Per-line element so each level can be colored (INFO blue / WARN yellow /
+    // ERROR red) — the old single-textContent blob couldn't style individual
+    // lines. Format is unchanged: "[HH:MM:SS] LEVEL msg".
+    const line = document.createElement("div");
+    line.className   = "log-line log-" + lvl.toLowerCase();
+    line.textContent = `[${ts}] ${lvl.padEnd(5)} ${msg}`;
+    logPre.appendChild(line);
+    while (logPre.childElementCount > MAX_LOG_LINES) {
+        logPre.removeChild(logPre.firstElementChild);
+    }
+    logPre.scrollTop = logPre.scrollHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +165,10 @@ function logMsg(msg, level = "INFO") {
 // ---------------------------------------------------------------------------
 
 const statusEl = document.getElementById("status-text");
-const metaEl   = document.getElementById("meta-text");
+// The applied-settings readout moved out of the (truncating) header into a
+// dedicated full-width band below the controls (see #applied-settings), so the
+// whole string is always readable and scrolls instead of clipping.
+const metaEl   = document.getElementById("applied-settings");
 
 function setStatus(text, cls = "") {
     statusEl.textContent = text;
@@ -298,7 +301,7 @@ function connect() {
                         setStatus("another admin is connected — waiting for the slot…", "warn");
                         logMsg("Admin slot busy; retrying until it frees", "WARN");
                     } else {
-                        applyRole(msg.role);
+                        applyRole(msg.role, msg.auth_enabled);
                     }
                     return;
                 }
@@ -318,8 +321,11 @@ function connect() {
     ws.onclose = (event) => {
         // Distinct close codes (LV-R3): 1008 = auth failed, 4001 = viewer slot busy.
         if (event && event.code === 1008) {
-            setStatus("authentication failed — reload to log in", "error");
+            setStatus("session expired — redirecting to sign in…", "error");
             logMsg("WebSocket closed: authentication failed (1008)", "ERROR");
+            // The signed cookie is missing/expired — send the browser to the
+            // login form rather than looping on a doomed reconnect.
+            setTimeout(() => { window.location.href = "/login"; }, 800);
             return;   // do NOT reconnect on an auth failure
         }
         if (event && event.code === 4001) {
@@ -352,18 +358,24 @@ function sendControl(ctrl) {
 // Role-based access control
 // ---------------------------------------------------------------------------
 
-function applyRole(role) {
+function applyRole(role, authEnabled = true) {
     currentRole = role;
     isAdmin     = (role === "admin");
     document.body.classList.toggle("role-viewer",  role === "viewer");
     document.body.classList.toggle("role-interns", role === "interns");
     document.body.classList.toggle("role-readonly", !isAdmin);
+    // Admin-only affordances (e.g. Reset Radio) are shown via this body class.
+    document.body.classList.toggle("is-admin", isAdmin);
     const badge = document.getElementById("role-badge");
     if (badge) {
         badge.textContent = isAdmin ? "ADMIN" : (role + " · read-only");
         badge.className   = isAdmin ? "role-badge admin" : "role-badge readonly";
         badge.hidden      = false;
     }
+    // Sign-out / switch-user button. Only meaningful when auth is enabled — in
+    // --demo / RADIO_AUTH_DISABLE mode there is nothing to sign out of.
+    const signout = document.getElementById("signout-btn");
+    if (signout) signout.hidden = !authEnabled;
     logMsg(`Signed in as '${role}'${isAdmin ? " (full control)" : " (read-only)"}`);
 }
 
@@ -394,11 +406,27 @@ function hideAccessDenied() {
 // (pre-connect, sub-second) nothing is blocked; the server enforces anyway.
 const CONTROL_SELECTOR =
     "button, input, select, textarea, label, .freq-chip, .mode-opt, #ctrl-toggle";
+// Controls a read-only role (viewer/intern) MAY use: purely cosmetic / layout, or
+// local-only display toggles that render client-side and send NOTHING to the
+// server (verified: none of these call sendControl). Anything not listed here —
+// center/rate/gain/FFT/duration/mode/analysis/LO-null/station tuner/apply/JSON —
+// changes the shared radio or other viewers and stays blocked.
+const SAFE_SELECTOR =
+    ".mode-opt, #ctrl-toggle, #signout-btn, " +
+    "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn";
 function installReadOnlyGuard() {
     const block = (ev) => {
         if (!currentRole || isAdmin) return;              // admin or not-yet-known
         const t = ev.target;
         if (t && t.closest && t.closest("#access-denied")) return;  // popup itself
+        // Allow the whitelisted safe controls through untouched — including a
+        // <label> that wraps one (clicking the label text targets the label, not
+        // the input inside it).
+        if (t && t.closest) {
+            if (t.closest(SAFE_SELECTOR)) return;
+            const lbl = t.closest("label");
+            if (lbl && lbl.querySelector(SAFE_SELECTOR)) return;
+        }
         if (!t || !t.closest || !t.closest(CONTROL_SELECTOR)) return;
         ev.preventDefault();
         ev.stopPropagation();
@@ -1555,12 +1583,48 @@ document.getElementById("abs-rf").addEventListener("change", (e) => {
     renderWfAxis();
 });
 
-document.getElementById("reset-btn").addEventListener("click", () => {
-    if (uplot) {
-        uplot.scales.x.auto = () => true;
-        uplot.scales.y.auto = () => true;
-    }
-});
+// Sign out / switch user: clear the session cookie (server-side) and land on
+// the login form, where a different role can sign in.
+const signoutBtn = document.getElementById("signout-btn");
+if (signoutBtn) {
+    signoutBtn.addEventListener("click", () => {
+        window.location.href = "/logout";
+    });
+}
+
+// Reset Radio (admin-only): restart the radio-web systemd service on the host.
+// This tears down the server and disconnects everyone for a few seconds; the
+// client's normal reconnect loop brings the viewer back once it's up again.
+// (uPlot restores PSD auto-scale on double-click, so no separate zoom-reset
+// button is needed anymore.)
+const resetRadioBtn = document.getElementById("reset-radio-btn");
+if (resetRadioBtn) {
+    resetRadioBtn.addEventListener("click", () => {
+        if (!isAdmin) return;   // guard also blocks it, but be explicit
+        const ok = window.confirm(
+            "Restart the radio service?\n\n" +
+            "This disconnects all viewers for a few seconds while the radio " +
+            "pipeline restarts."
+        );
+        if (!ok) return;
+        logMsg("Reset Radio requested — restarting service…", "WARN");
+        fetch("/admin/reset-radio", { method: "POST" })
+            .then((r) => r.json().then((j) => ({ status: r.status, j })))
+            .then(({ status, j }) => {
+                if (status === 202) {
+                    logMsg(j.message || "restarting…", "WARN");
+                    setStatus("radio restarting — reconnecting…", "warn");
+                } else {
+                    logMsg(`Reset Radio failed (${status}): ${j.error || "unknown"}`, "ERROR");
+                }
+            })
+            .catch((err) => {
+                // A dropped connection mid-restart is expected — the reconnect
+                // loop handles it; only log a real fetch error.
+                logMsg(`Reset Radio: ${err.message} (service may be restarting)`, "WARN");
+            });
+    });
+}
 
 document.getElementById("csv-btn").addEventListener("click", savePsdCsv);
 document.getElementById("png-btn").addEventListener("click", exportPng);

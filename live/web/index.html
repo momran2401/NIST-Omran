@@ -16,10 +16,9 @@
 <!-- ── App header ────────────────────────────────────────────────────────── -->
 <header id="app-header">
     <div class="brand">
-        <span class="brand-mark"></span>
         <div class="brand-text">
-            <h1>Live Viewer</h1>
-            <p>Spectrogram &amp; PSD</p>
+            <h1>SDR LIVE Viewer</h1>
+            <p>National Institute of Standards and Technology</p>
         </div>
     </div>
 
@@ -34,7 +33,9 @@
             <span id="status-text">connecting…</span>
         </span>
         <span id="role-badge" class="role-badge" hidden></span>
-        <span id="meta-text"></span>
+        <button id="signout-btn" type="button" title="Sign out / switch user" hidden>
+            Sign out
+        </button>
     </div>
 
     <button id="ctrl-toggle" class="pro-only" type="button" aria-expanded="true" aria-controls="controls">
@@ -95,7 +96,7 @@
         <label class="check pro-only" title="Blank the LO leakage region at band center (calibrated/SSB only)"><input type="checkbox" id="lo-null" checked> LO null</label>
         <label class="check pro-only"><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
 
-        <button id="reset-btn" class="pro-only">Reset view</button>
+        <button id="reset-radio-btn" class="pro-only admin-only" title="Restart the radio-web service (all viewers briefly disconnect)">Reset Radio</button>
         <button id="csv-btn" class="pro-only">Save PSD CSV</button>
         <button id="png-btn" class="pro-only">Export PNG</button>
     </div>
@@ -174,6 +175,16 @@
 
 <!-- ── Main dashboard ────────────────────────────────────────────────────── -->
 <main id="dashboard">
+
+    <!-- Applied settings: the live radio/display config, moved out of the header
+         (which truncated it) into a full-width band that scrolls horizontally so
+         the whole string is always readable on mobile and desktop. -->
+    <section class="panel" id="applied-panel">
+        <div class="panel-head">
+            <h2>Applied settings</h2>
+        </div>
+        <div id="applied-settings">waiting for first frame…</div>
+    </section>
 
     <!-- Noob frequency tuner (NOOB mode only) -->
     <section class="panel noob-only" id="noob-tuner">

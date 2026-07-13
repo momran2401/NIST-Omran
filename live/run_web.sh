@@ -27,6 +27,16 @@
 #
 #   For production: set RADIO_SESSION_SECRET and override the default passwords, e.g.
 #     ADMIN_PASS='…' VIEWER_PASS='…' INTERN_PASS='…' RADIO_SESSION_SECRET='…' bash live/run_web.sh
+#
+#   Sign-in flow: browsers are redirected to a /login form (cookie session), so
+#   the "Sign out" button in the header reliably switches users. `curl -u` Basic
+#   Auth still works for scripts/API.
+#
+# "Reset Radio" button (admin-only): restarts the systemd unit named by
+#   RADIO_SERVICE_NAME (default "radio-web") via `sudo -n systemctl restart …`.
+#   For it to work without a stored password, run ONCE on the radio host:
+#     sudo bash live/install_radio_web_sudoers.sh <service-user> [radio-web]
+#   That writes a scoped /etc/sudoers.d/radio-web NOPASSWD rule (no secret stored).
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

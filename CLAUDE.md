@@ -83,6 +83,25 @@ FastAPI app (uvicorn)          _broadcaster() asyncio task
 - `live/web/app.js` parses binary frames, renders waterfalls via `ImageData` + viridis LUT (`colormap.js`), and renders PSD via uPlot.
 - Band monitor computes power in the **linear** domain (correct; avoids the dB-averaging error in older scripts).
 
+### Auth, sign-in, and Reset Radio
+
+- Three roles (`admin` / `viewer` / `interns`); only `admin` may mutate config.
+  Credentials + `RADIO_SESSION_SECRET` are documented in `run_web.sh`'s header.
+- Browser auth is **cookie-only**: unauthenticated page loads are redirected to a
+  `GET /login` form (`POST /login` sets the signed `radio_auth` cookie), and
+  `GET /logout` clears it. This is why the header "Sign out" button reliably
+  switches users — the old Basic-Auth 401 challenge is no longer sent to browsers
+  (a Basic header is still *accepted* for `curl -u`/API). The WS role message
+  includes `auth_enabled` so the UI hides sign-out in `--demo`/`RADIO_AUTH_DISABLE=1`.
+- Read-only roles may use a whitelist of harmless, client-only controls (DAN/ARIC
+  switch, Controls collapse, and the local PSD display toggles: peak marker/hold,
+  RX1−RX2 diff, min trace, clear hold — see `SAFE_SELECTOR` in `app.js`); everything
+  that calls `sendControl` stays blocked.
+- **Reset Radio** (admin-only `POST /admin/reset-radio`) runs
+  `sudo -n systemctl restart $RADIO_SERVICE_NAME` (default `radio-web`) detached.
+  It needs the passwordless sudoers rule installed once via
+  `live/install_radio_web_sudoers.sh` (no password is stored anywhere).
+
 ## Known bugs
 
 Every issue in `bug_report.md` (A-1/P-3, F-3/A-3, T-1, S-1/S-2, F-2, P-5) was already
