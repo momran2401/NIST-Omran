@@ -94,9 +94,10 @@ FastAPI app (uvicorn)          _broadcaster() asyncio task
   (a Basic header is still *accepted* for `curl -u`/API). The WS role message
   includes `auth_enabled` so the UI hides sign-out in `--demo`/`RADIO_AUTH_DISABLE=1`.
 - Read-only roles may use a whitelist of harmless, client-only controls (DAN/ARIC
-  switch, Controls collapse, and the local PSD display toggles: peak marker/hold,
-  RX1−RX2 diff, min trace, clear hold — see `SAFE_SELECTOR` in `app.js`); everything
-  that calls `sendControl` stays blocked.
+  switch, Controls collapse, Pause, Max fps, Auto color, Absolute RF, CSV/PNG export,
+  and the local PSD display toggles: peak marker/hold, RX1−RX2 diff, min trace, clear
+  hold, crosshair, Y span — see `SAFE_SELECTOR` in `app.js`); everything that calls
+  `sendControl` stays blocked.
 - **Reset Radio** (admin-only `POST /admin/reset-radio`) runs
   `sudo -n systemctl restart $RADIO_SERVICE_NAME` (default `radio-web`) detached.
   It needs the passwordless sudoers rule installed once via

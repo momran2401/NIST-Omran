@@ -3407,7 +3407,15 @@ def capture_editor_schema():
 
 @app.get("/schema")
 async def schema_endpoint():
-    return JSONResponse(capture_editor_schema())
+    # striqt may be absent when running --demo on a machine without the SDR
+    # stack; answer with a clean 503 (the client logs it and skips the capture
+    # editor) instead of an unhandled-500 traceback on every page load.
+    try:
+        return JSONResponse(capture_editor_schema())
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"capture schema unavailable: {exc}"}, status_code=503
+        )
 
 
 def current_config():

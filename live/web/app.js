@@ -413,7 +413,8 @@ const CONTROL_SELECTOR =
 // changes the shared radio or other viewers and stays blocked.
 const SAFE_SELECTOR =
     ".mode-opt, #ctrl-toggle, #signout-btn, " +
-    "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn";
+    "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn, #cross-chk, " +
+    "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn";
 function installReadOnlyGuard() {
     const block = (ev) => {
         if (!currentRole || isAdmin) return;              // admin or not-yet-known
