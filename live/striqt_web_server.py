@@ -3522,7 +3522,7 @@ def _login_page(error: str = "") -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>Sign in · SDR LIVE Viewer</title>
+<title>Sign in · SDR LIVE Viewer - Div. 675</title>
 <style>
   :root {{ --bg:#0b0f14; --panel:#111823; --border:#22303f; --text:#e6edf3;
           --dim:#8aa0b3; --accent:#4ea3ff; }}
@@ -3547,7 +3547,7 @@ def _login_page(error: str = "") -> str:
           padding:8px 10px; border-radius:8px; font-size:13px; margin:0 0 4px; }}
 </style></head><body>
   <form class="card" method="post" action="/login" autocomplete="off">
-    <h1>SDR LIVE Viewer</h1>
+    <h1>SDR LIVE Viewer - Div. 675</h1>
     <p class="sub">National Institute of Standards and Technology</p>
     {err_html}
     <label for="u">Username</label>
