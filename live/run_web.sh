@@ -14,6 +14,19 @@
 # Requirements:
 #   pip install fastapi 'uvicorn[standard]'
 #   cloudflared in PATH  (see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+#
+# Authentication (three roles; all optional — built-in defaults are used when unset):
+#   ADMIN_USER  / ADMIN_PASS   default: admin  / admin1234              (full control, 1 at a time)
+#   VIEWER_USER / VIEWER_PASS  default: viewer / aricsfavinternmadethis (read-only)
+#   INTERN_USER / INTERN_PASS  default: interns/ tylersucks             (read-only)
+#   RADIO_SESSION_SECRET       cookie-signing key. STRONGLY recommended for any
+#                              real deployment — without it the key is derived
+#                              from the (possibly default) passwords and may be
+#                              forgeable. e.g. export RADIO_SESSION_SECRET="$(openssl rand -hex 32)"
+#   RADIO_AUTH_DISABLE=1       turn auth OFF for local/demo; everyone becomes admin.
+#
+#   For production: set RADIO_SESSION_SECRET and override the default passwords, e.g.
+#     ADMIN_PASS='…' VIEWER_PASS='…' INTERN_PASS='…' RADIO_SESSION_SECRET='…' bash live/run_web.sh
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

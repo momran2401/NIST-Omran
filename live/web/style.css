@@ -659,3 +659,65 @@ body.mode-noob .pro-only  { display: none !important; }
     text-transform: uppercase;
     letter-spacing: 0.07em;
 }
+
+/* ── Role badge (status bar) ───────────────────────────────────────────── */
+.role-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+}
+.role-badge.admin {
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+}
+.role-badge.readonly {
+    background: rgba(245,215,80,0.12);
+    border: 1px solid var(--yellow);
+    color: var(--yellow);
+}
+
+/* ── Access-denied popup (read-only roles) ─────────────────────────────── */
+#access-denied {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.92);
+    z-index: 1000;
+    max-width: 80vw;
+    padding: 22px 30px;
+    border-radius: var(--radius);
+    background: var(--panel);
+    border: 1px solid var(--red);
+    box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 18px;
+    font-weight: 650;
+    text-align: center;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.14s ease, transform 0.14s ease;
+}
+#access-denied.show {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+    pointer-events: auto;
+    animation: deny-pop 0.22s ease;
+}
+@keyframes deny-pop {
+    0%   { transform: translate(-50%, -50%) scale(0.85); }
+    60%  { transform: translate(-50%, -50%) scale(1.04); }
+    100% { transform: translate(-50%, -50%) scale(1); }
+}
+
+/* Read-only affordance: dim the control panels so it's visually clear the
+   viewer can look but not touch (the interceptor still shows the popup). */
+body.role-readonly #controls { opacity: 0.6; }

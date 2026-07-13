@@ -286,47 +286,75 @@ DEFAULT_PSD_TIME_STATISTIC = ("mean", "max")
 
 
 # ---------------------------------------------------------------------------
-# HTTP Basic Auth (single shared credential, read from the environment)
+# HTTP Basic Auth (three role-bearing credentials, read from the environment)
 # ---------------------------------------------------------------------------
 #
-# Set RADIO_USER and RADIO_PASS in the environment to put the whole viewer
-# (static page, assets, and the /ws WebSocket) behind one shared login. If
-# either is unset, auth is DISABLED so --demo / local dev keeps working — a
-# loud warning is printed at startup in that case.
+# The viewer (static page, assets, and the /ws WebSocket) is gated behind one of
+# three logins, each mapping to a role:
+#
+#   admin   → full control (only ONE admin connected at a time)
+#   viewer  → read-only; every control shows an "access denied" popup
+#   interns → read-only; same, with a different popup message
+#
+# Each user/pass is overridable via env vars (ADMIN_USER/ADMIN_PASS,
+# VIEWER_USER/VIEWER_PASS, INTERN_USER/INTERN_PASS) and falls back to a built-in
+# default when unset. Because defaults always exist, auth is effectively ALWAYS
+# ENABLED. Set RADIO_AUTH_DISABLE=1 to turn it off for --demo / local dev, in
+# which case everyone is granted DEFAULT_ROLE. A loud warning prints at startup
+# whenever default passwords or a disabled gate are in effect.
 
-_AUTH_USER  = os.environ.get("RADIO_USER") or ""
-_AUTH_PASS  = os.environ.get("RADIO_PASS") or ""
-AUTH_ENABLED = bool(_AUTH_USER and _AUTH_PASS)
-AUTH_REALM   = "striqt live viewer"
+_ROLE_CREDS = {
+    "admin":   (os.environ.get("ADMIN_USER")  or "admin",
+                os.environ.get("ADMIN_PASS")  or "admin1234"),
+    "viewer":  (os.environ.get("VIEWER_USER") or "viewer",
+                os.environ.get("VIEWER_PASS") or "aricsfavinternmadethis"),
+    "interns": (os.environ.get("INTERN_USER") or "interns",
+                os.environ.get("INTERN_PASS") or "tylersucks"),
+}
+WRITE_ROLES   = frozenset({"admin"})            # roles allowed to mutate config
+AUTH_DISABLED = os.environ.get("RADIO_AUTH_DISABLE") == "1"
+DEFAULT_ROLE  = "admin"                          # role granted when auth disabled
+AUTH_ENABLED  = not AUTH_DISABLED
+AUTH_REALM    = "striqt live viewer"
 
 
-def check_basic_auth(auth_header) -> bool:
+def authenticate(auth_header) -> "str | None":
     """
-    Validate an HTTP `Authorization` header against RADIO_USER/RADIO_PASS using
-    constant-time comparison. Returns True when auth is disabled (no creds set)
-    so local/demo runs are unaffected.
+    Resolve an HTTP `Authorization` header to a role name, or None when the
+    credentials match no known login. Returns DEFAULT_ROLE when auth is disabled
+    so --demo / local dev keeps full control.
+
+    Constant-time across all three credentials: the supplied user/pass is
+    compared against EVERY row on every call, using bitwise `&` (no `and`
+    short-circuit) and no early return, so response time never reveals which
+    usernames exist or which row matched.
 
     `auth_header` may be a str (Starlette Request) or bytes (raw ASGI scope).
     """
-    if not AUTH_ENABLED:
-        return True
+    if AUTH_DISABLED:
+        return DEFAULT_ROLE
     if not auth_header:
-        return False
+        return None
     if isinstance(auth_header, bytes):
         auth_header = auth_header.decode("latin-1")
 
     scheme, _, param = auth_header.partition(" ")
     if scheme.lower() != "basic":
-        return False
+        return None
     try:
         user, _, pw = base64.b64decode(param).decode("utf-8").partition(":")
     except Exception:
-        return False
+        return None
 
-    # Compare BOTH fields every time (no short-circuit) to avoid timing leaks.
-    user_ok = secrets.compare_digest(user, _AUTH_USER)
-    pw_ok   = secrets.compare_digest(pw, _AUTH_PASS)
-    return user_ok and pw_ok
+    matched_role = None
+    for role, (u, p) in _ROLE_CREDS.items():
+        # Evaluate BOTH digests every iteration (bitwise &, never short-circuit)
+        # and never break/return early, so total time is independent of which
+        # row — if any — matches.
+        ok = bool(secrets.compare_digest(user, u)) & bool(secrets.compare_digest(pw, p))
+        if ok:
+            matched_role = role
+    return matched_role
 
 
 # ---------------------------------------------------------------------------
@@ -339,68 +367,86 @@ def check_basic_auth(auth_header) -> bool:
 # authenticates we hand the browser a signed "radio_auth" cookie; the cookie is
 # carried automatically on the subsequent WS handshake and accepted there.
 #
-# The signing secret is derived from the existing RADIO_USER/RADIO_PASS — no new
-# env var — so rotating the password invalidates outstanding tokens.
+# The token now carries the authenticated ROLE (not just an expiry) so the role
+# survives the cookie-only path that Safari/iOS use for the WS upgrade. The role
+# is inside the HMAC, so a viewer cannot self-elevate by editing the cookie.
+#
+# The signing secret comes from RADIO_SESSION_SECRET when set; otherwise it is
+# derived deterministically from ALL three role credentials (not any single
+# password). NOTE: with the built-in default passwords the derived secret is
+# predictable to anyone who reads the source — a real deployment should set
+# RADIO_SESSION_SECRET and override the default passwords so cookies can't be
+# forged (a startup warning nags about this).
 
 _SESSION_SECRET = hashlib.sha256(
-    (_AUTH_USER + ":" + _AUTH_PASS).encode()
+    (os.environ.get("RADIO_SESSION_SECRET")
+     or "|".join(f"{r}:{u}:{p}" for r, (u, p) in _ROLE_CREDS.items())
+    ).encode()
 ).digest()
 SESSION_TTL = 86400
 
 
-def make_session_token(ttl_seconds: int = SESSION_TTL) -> str:
+def make_session_token(role: str, ttl_seconds: int = SESSION_TTL) -> str:
     """
-    Build a signed session token "<exp>.<hex_hmac>" where exp is an int unix
-    expiry and hex_hmac = HMAC-SHA256(secret, str(exp)). Unused when auth is
-    disabled.
+    Build a signed session token "<role>.<exp>.<hex_hmac>" where exp is an int
+    unix expiry and hex_hmac = HMAC-SHA256(secret, "<role>.<exp>"). The role is
+    covered by the MAC so it cannot be tampered with.
     """
     exp = int(time.time()) + ttl_seconds
-    mac = hmac.new(_SESSION_SECRET, str(exp).encode(), hashlib.sha256).hexdigest()
-    return f"{exp}.{mac}"
+    payload = f"{role}.{exp}"
+    mac = hmac.new(_SESSION_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{mac}"
 
-
-def verify_session_token(token) -> bool:
+def verify_session_token(token) -> "str | None":
     """
-    Validate a "<exp>.<hex_hmac>" session token: recompute the HMAC with a
-    constant-time comparison and confirm the expiry is still in the future.
-    Returns False on any malformed input. A no-op (unused) when auth is disabled.
+    Validate a "<role>.<exp>.<hex_hmac>" session token: recompute the HMAC with a
+    constant-time comparison, confirm the role is known, and confirm the expiry
+    is still in the future. Returns the role on success, else None on any
+    malformed / tampered / expired input.
     """
     if not token:
-        return False
+        return None
     if isinstance(token, bytes):
         token = token.decode("latin-1")
 
-    exp_str, _, mac = token.partition(".")
-    if not mac:
-        return False
+    role, _, rest = token.partition(".")
+    exp_str, _, mac = rest.partition(".")
+    if not role or not mac:
+        return None
+    if role not in _ROLE_CREDS:          # reject forged / unknown roles
+        return None
     try:
         exp = int(exp_str)
     except ValueError:
-        return False
+        return None
 
+    payload = f"{role}.{exp_str}"
     expected = hmac.new(
-        _SESSION_SECRET, exp_str.encode(), hashlib.sha256
+        _SESSION_SECRET, payload.encode(), hashlib.sha256
     ).hexdigest()
     if not secrets.compare_digest(mac, expected):
-        return False
-    return exp > int(time.time())
+        return None
+    if exp <= int(time.time()):
+        return None
+    return role
 
 
-def _session_cookie_from_scope(scope) -> bool:
+def _session_cookie_from_scope(scope) -> "str | None":
     """
-    Parse the request's Cookie header from a raw ASGI scope and return True when
-    a "radio_auth" cookie is present and passes verify_session_token.
+    Parse the request's Cookie header from a raw ASGI scope and return the role
+    when a "radio_auth" cookie is present and passes verify_session_token, else
+    None.
     """
     headers = dict(scope.get("headers") or [])
     raw_cookie = headers.get(b"cookie")
     if not raw_cookie:
-        return False
+        return None
     cookie_str = raw_cookie.decode("latin-1")
     for part in cookie_str.split(";"):
         name, _, value = part.strip().partition("=")
         if name == "radio_auth":
             return verify_session_token(value)
-    return False
+    return None
 
 
 class BasicAuthMiddleware:
@@ -422,14 +468,14 @@ class BasicAuthMiddleware:
         self.app = app
 
     @staticmethod
-    def _set_cookie_send(scope, send):
+    def _set_cookie_send(scope, send, role):
         """
-        Wrap `send` to append a Set-Cookie header carrying a fresh session token
-        on the HTTP response start. Only the success path uses this, so the
-        cookie is never attached to a 401. The `Secure` attribute is omitted over
-        plain HTTP (LAN) so Safari/iOS — which refuse to store a Secure cookie
-        without TLS and won't replay Basic on the WS upgrade — can still reach /ws
-        (LV-R8). HttpOnly and SameSite=Lax are always set.
+        Wrap `send` to append a Set-Cookie header carrying a fresh role-bearing
+        session token on the HTTP response start. Only the success path uses
+        this, so the cookie is never attached to a 401. The `Secure` attribute is
+        omitted over plain HTTP (LAN) so Safari/iOS — which refuse to store a
+        Secure cookie without TLS and won't replay Basic on the WS upgrade — can
+        still reach /ws (LV-R8). HttpOnly and SameSite=Lax are always set.
         """
         headers_in = dict(scope.get("headers") or [])
         is_https = (
@@ -441,7 +487,7 @@ class BasicAuthMiddleware:
         async def wrapped(message):
             if message["type"] == "http.response.start":
                 cookie = (
-                    f"radio_auth={make_session_token()}; Path=/; HttpOnly; "
+                    f"radio_auth={make_session_token(role)}; Path=/; HttpOnly; "
                     f"{secure_attr}SameSite=Lax; Max-Age={SESSION_TTL}"
                 )
                 headers = list(message.get("headers") or [])
@@ -452,19 +498,33 @@ class BasicAuthMiddleware:
         return wrapped
 
     async def __call__(self, scope, receive, send):
-        if not AUTH_ENABLED or scope["type"] not in ("http", "websocket"):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        if AUTH_DISABLED:
+            # Auth off (demo/local): everyone gets DEFAULT_ROLE so the endpoint
+            # always sees a role and controls aren't silently locked out.
+            scope["role"] = DEFAULT_ROLE
+            scope["user"] = DEFAULT_ROLE
             await self.app(scope, receive, send)
             return
 
         headers = dict(scope.get("headers") or [])
-        # Authenticated via Basic Auth header OR a valid signed session cookie.
-        # The cookie path lets browsers that drop Basic creds on the WS upgrade
-        # (Safari / all iOS browsers) still connect to /ws after logging in.
-        if check_basic_auth(headers.get(b"authorization")) or _session_cookie_from_scope(scope):
+        # Resolve the role from the Basic Auth header, falling back to a valid
+        # signed session cookie. The cookie path lets browsers that drop Basic
+        # creds on the WS upgrade (Safari / all iOS) still connect to /ws after
+        # logging in for the page.
+        role = authenticate(headers.get(b"authorization")) or _session_cookie_from_scope(scope)
+        if role:
+            # The same dict is ws.scope / request.scope in the endpoint, so this
+            # is how the role reaches ws_endpoint.
+            scope["role"] = role
+            scope["user"] = role
             if scope["type"] == "http":
-                # Refresh the session cookie so the browser carries it on the
-                # WS handshake. Never set it on websocket scopes.
-                await self.app(scope, receive, self._set_cookie_send(scope, send))
+                # Refresh the role-bearing cookie so the browser carries it on
+                # the WS handshake. Never set it on websocket scopes.
+                await self.app(scope, receive, self._set_cookie_send(scope, send, role))
             else:
                 await self.app(scope, receive, send)
             return
@@ -3229,8 +3289,9 @@ _acquirer: "Acquirer | DemoAcquirer | None" = None
 _computer: "Computer | None"                 = None
 _shared:   "SharedConfig | None"             = None
 _quantize: bool                              = False
-_connections: set                            = set()
-_slot_lock                                   = asyncio.Lock()  # guards the single-viewer slot
+_connections: set                            = set()  # ALL clients (broadcast fan-out set)
+_slot_lock                                   = asyncio.Lock()  # guards the single-admin slot
+_admin_ws: "object | None"                   = None  # the one active admin socket, or None
 
 
 @asynccontextmanager
@@ -3459,19 +3520,32 @@ async def ws_endpoint(ws: WebSocket):
         {"center": Hz, "sample_rate": Hz, "gain": dB, "nfft": int, "rows": int}
     Sends spectrogram frames as binary (see serialize_frame).
     """
-    # Single-viewer slot, guarded so two interleaving handshakes can't both pass
-    # the empty check (LV-R3). Busy refusals use a distinct 4001 code (vs 1008 for
-    # auth) so the client can tell "another viewer connected" from "unauthorized".
+    global _admin_ws
+    # Role resolved by BasicAuthMiddleware and stashed on the ASGI scope. Falls
+    # back to DEFAULT_ROLE (auth-disabled/demo) so a missing key never locks a
+    # client out.
+    role = ws.scope.get("role", DEFAULT_ROLE)
+
+    # Viewers/interns are unlimited; only ONE admin may hold the slot at a time.
+    # The check-and-set is under _slot_lock so two interleaving admin handshakes
+    # can't both see the slot free. A busy refusal uses a distinct 4001 code (vs
+    # 1008 for auth) so the client can tell "another admin connected" from
+    # "unauthorized"; the browser's auto-retry then acts as a takeover queue.
     async with _slot_lock:
-        if _connections:
+        if role == "admin" and _admin_ws is not None:
             await ws.accept()
+            await ws.send_text(json.dumps({"role": role, "error": "admin-busy"}))
             await ws.close(code=4001)
-            print(f"[ws] refused extra client (slot busy): {ws.client}")
+            print(f"[ws] refused extra admin (slot busy): {ws.client}")
             return
         await ws.accept()
         _connections.add(ws)
+        if role == "admin":
+            _admin_ws = ws
+    # Tell the client its role immediately so app.js can enable/lock controls.
+    await ws.send_text(json.dumps({"role": role}))
     client = ws.client
-    print(f"[ws] client connected: {client}")
+    print(f"[ws] client connected: {client} (role={role})")
     misses = 0
     try:
         while True:
@@ -3492,6 +3566,15 @@ async def ws_endpoint(ws: WebSocket):
                 continue
             try:
                 ctrl = json.loads(text)
+                # Role gate (defense in depth): read-only roles may never mutate
+                # the shared config. The UI already blocks their controls, but a
+                # crafted frame must be ignored here too. Stay connected so the
+                # client keeps receiving live frames.
+                if role not in WRITE_ROLES:
+                    await ws.send_text(json.dumps(
+                        {"message": "read-only role: control ignored", "denied": True}
+                    ))
+                    continue
                 # Run in a worker thread: an analysis apply blocks on tier-2
                 # probes serviced by the compute thread (up to ~0.1 s per
                 # field), which must not stall the event loop / broadcaster.
@@ -3533,7 +3616,15 @@ async def ws_endpoint(ws: WebSocket):
         print(f"[ws] client {client} error: {e}")
     finally:
         _connections.discard(ws)
-        print(f"[ws] client disconnected: {client}")
+        # Free the admin slot only if this socket owned it (verify identity to
+        # survive a takeover race). Under the lock so it can't clobber a fresh
+        # admin that grabbed the slot between our break and here. The liveness
+        # ping above doubles as dead-admin eviction, funnelling through here.
+        if role == "admin":
+            async with _slot_lock:
+                if _admin_ws is ws:
+                    _admin_ws = None
+        print(f"[ws] client disconnected: {client} (role={role})")
 
 
 # Mount static files last so the /ws route takes priority
@@ -3646,18 +3737,30 @@ def main():
     print(f"  backend={SPEC_BACKEND}, fps={BROADCAST_FPS:.0f}{q_note}")
 
     # Report auth status loudly so an unintentionally-open public server is obvious.
-    if AUTH_ENABLED:
-        print(f"  auth:     Basic Auth ENABLED (user '{_AUTH_USER}', from RADIO_USER/RADIO_PASS)")
-    elif os.environ.get("RADIO_USER") or os.environ.get("RADIO_PASS"):
+    if AUTH_DISABLED:
         print(
-            "  auth:     *** WARNING: only one of RADIO_USER / RADIO_PASS set — "
-            "auth DISABLED. Set BOTH to enable the login. ***"
+            "  auth:     *** WARNING: RADIO_AUTH_DISABLE=1 — auth DISABLED, "
+            f"everyone gets role '{DEFAULT_ROLE}'. Do NOT use in production. ***"
         )
     else:
-        print(
-            "  auth:     *** WARNING: auth DISABLED — server is OPEN to anyone. "
-            "Set RADIO_USER and RADIO_PASS to require a login. ***"
+        print(f"  auth:     3-role Basic Auth ENABLED (roles: {', '.join(_ROLE_CREDS)})")
+        _env_for = {"admin": "ADMIN", "viewer": "VIEWER", "interns": "INTERN"}
+        using_defaults = any(
+            os.environ.get(f"{p}_USER") is None or os.environ.get(f"{p}_PASS") is None
+            for p in _env_for.values()
         )
+        if using_defaults:
+            print(
+                "            *** WARNING: one or more roles use built-in DEFAULT "
+                "passwords (visible in source). Override ADMIN/VIEWER/INTERN "
+                "_USER/_PASS for production. ***"
+            )
+        if not os.environ.get("RADIO_SESSION_SECRET"):
+            print(
+                "            *** WARNING: RADIO_SESSION_SECRET unset — cookie "
+                "signing key is derived from (possibly default) credentials and "
+                "may be forgeable. Set it for production. ***"
+            )
 
     print(f"  listening on http://{args.host}:{args.port}")
     if args.host in ("0.0.0.0", "::"):

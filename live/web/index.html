@@ -33,6 +33,7 @@
             <span class="status-dot"></span>
             <span id="status-text">connecting…</span>
         </span>
+        <span id="role-badge" class="role-badge" hidden></span>
         <span id="meta-text"></span>
     </div>
 
@@ -236,6 +237,10 @@
     <span class="footer-credit">Built by <strong>Mustafa Omran</strong> · 2026 NIST SURF Fellow · Communications Technology Laboratory</span>
     <span class="footer-restrict">For authorized NIST users only</span>
 </footer>
+
+<!-- ── Access-denied popup (shown to read-only roles on any control) ──────── -->
+<div id="access-denied" role="alert" aria-live="assertive" hidden></div>
+
 <!-- ── Scripts ───────────────────────────────────────────────────────────── -->
 <script src="colormap.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>

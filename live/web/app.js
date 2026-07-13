@@ -36,6 +36,17 @@ let analysisMode = "spectrogram";
 let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
 let lastRender  = 0;        // performance.now() of the last rendered frame
 
+// Role-based access. The server sends {"role": "admin"|"viewer"|"interns"} as
+// the first WS text frame. null = not yet known (pre-connect); non-admin roles
+// are read-only and get an "access denied" popup on any control interaction.
+let currentRole = null;
+let isAdmin     = false;
+// Popup message per read-only role.
+const DENY_MESSAGES = {
+    viewer:  "access denied 🚫 admin privileges required",
+    interns: "fuck you 🖕",
+};
+
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
 let curFs       = 15.36e6;
@@ -279,6 +290,18 @@ function connect() {
         if (typeof e.data === "string") {
             try {
                 const msg = JSON.parse(e.data);
+                // First text frame carries the role. An "admin-busy" error means
+                // this admin login is queued behind the active one (4001 close
+                // follows); a plain {role} sets our capability level.
+                if (msg.role !== undefined) {
+                    if (msg.error === "admin-busy") {
+                        setStatus("another admin is connected — waiting for the slot…", "warn");
+                        logMsg("Admin slot busy; retrying until it frees", "WARN");
+                    } else {
+                        applyRole(msg.role);
+                    }
+                    return;
+                }
                 if (msg.message && msg.message !== "ping") logMsg(msg.message);
                 if (msg.ack) {
                     handleAck(msg.ack);
@@ -300,8 +323,8 @@ function connect() {
             return;   // do NOT reconnect on an auth failure
         }
         if (event && event.code === 4001) {
-            setStatus("another viewer is connected — retrying…", "warn");
-            logMsg("Viewer slot busy (4001); retrying in 1.2 s", "WARN");
+            setStatus("another admin is connected — retrying…", "warn");
+            logMsg("Admin slot busy (4001); retrying in 1.2 s", "WARN");
         } else {
             setStatus("disconnected — reconnecting…", "warn");
             logMsg("WebSocket disconnected; retrying in 1.2 s", "WARN");
@@ -313,9 +336,84 @@ function connect() {
 }
 
 function sendControl(ctrl) {
+    // Secondary guard: read-only roles must never emit a control frame even if
+    // something bypasses the capture-phase interceptor. The server also ignores
+    // these, but blocking here avoids a pointless round-trip + denial log.
+    if (currentRole && !isAdmin) {
+        showAccessDenied();
+        return;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(ctrl));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Role-based access control
+// ---------------------------------------------------------------------------
+
+function applyRole(role) {
+    currentRole = role;
+    isAdmin     = (role === "admin");
+    document.body.classList.toggle("role-viewer",  role === "viewer");
+    document.body.classList.toggle("role-interns", role === "interns");
+    document.body.classList.toggle("role-readonly", !isAdmin);
+    const badge = document.getElementById("role-badge");
+    if (badge) {
+        badge.textContent = isAdmin ? "ADMIN" : (role + " · read-only");
+        badge.className   = isAdmin ? "role-badge admin" : "role-badge readonly";
+        badge.hidden      = false;
+    }
+    logMsg(`Signed in as '${role}'${isAdmin ? " (full control)" : " (read-only)"}`);
+}
+
+let _denyHideTimer = null;
+function showAccessDenied() {
+    const pop = document.getElementById("access-denied");
+    if (!pop) return;
+    pop.textContent = DENY_MESSAGES[currentRole] || DENY_MESSAGES.viewer;
+    pop.hidden = false;
+    // restart the CSS pop animation
+    pop.classList.remove("show");
+    void pop.offsetWidth;
+    pop.classList.add("show");
+    clearTimeout(_denyHideTimer);
+    _denyHideTimer = setTimeout(hideAccessDenied, 2000);
+}
+function hideAccessDenied() {
+    const pop = document.getElementById("access-denied");
+    if (!pop) return;
+    pop.classList.remove("show");
+    pop.hidden = true;
+}
+
+// Capture-phase interceptor: for a known read-only role, any interaction with an
+// interactive control anywhere on the page is swallowed and shows the popup —
+// the strict "view only, touch nothing" behaviour. Runs in the CAPTURE phase so
+// it fires before each control's own listener. While currentRole is null
+// (pre-connect, sub-second) nothing is blocked; the server enforces anyway.
+const CONTROL_SELECTOR =
+    "button, input, select, textarea, label, .freq-chip, .mode-opt, #ctrl-toggle";
+function installReadOnlyGuard() {
+    const block = (ev) => {
+        if (!currentRole || isAdmin) return;              // admin or not-yet-known
+        const t = ev.target;
+        if (t && t.closest && t.closest("#access-denied")) return;  // popup itself
+        if (!t || !t.closest || !t.closest(CONTROL_SELECTOR)) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (typeof ev.stopImmediatePropagation === "function") ev.stopImmediatePropagation();
+        showAccessDenied();
+    };
+    for (const type of ["pointerdown", "click", "change", "input", "keydown"]) {
+        document.addEventListener(type, block, true);   // capture phase
+    }
+    // Dismiss the popup by clicking it or pressing Escape.
+    const pop = document.getElementById("access-denied");
+    if (pop) pop.addEventListener("click", hideAccessDenied);
+    document.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") hideAccessDenied();
+    });
 }
 
 // Surface the server's structured settings ack (P2a-2): what applied cleanly,
@@ -1935,6 +2033,7 @@ ensureChannels([0, 1]);
 freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
 initUplot(freqsMHz);
 updateSsbOption();
+installReadOnlyGuard();
 
 connect();
 loadSchema().catch((err) => logMsg(`Schema load failed: ${err.message}`, "ERROR"));
