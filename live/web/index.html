@@ -4,28 +4,33 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
-    <!-- Neutral fallbacks — app.js replaces these with the active device's
-         label + channel count from the frame header / config (P3-5). -->
     <title>Live Spectrogram + PSD</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <!-- uPlot: fast canvas charting for the PSD plot. CDN; can be vendored. -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
 </head>
 <body class="mode-pro">
 
-<!-- ── App header ────────────────────────────────────────────────────────── -->
+<!-- ══ HEADER ═══════════════════════════════════════════════════════════════ -->
 <header id="app-header">
     <div class="brand">
-        <div class="brand-text">
-            <h1>SDR LIVE Viewer</h1>
-            <p>National Institute of Standards and Technology</p>
-        </div>
+        <div class="brand-title">SDR·LIVE</div>
+        <div class="brand-sub" id="brand-device">NIST · CTL</div>
     </div>
 
-    <div class="mode-switch" role="group" aria-label="Interface mode">
-        <button type="button" class="mode-opt" data-mode="pro">DAN MODE</button>
-        <button type="button" class="mode-opt" data-mode="noob">ARIC MODE</button>
+    <div class="hdiv"></div>
+
+    <div class="freq-readout">
+        <span id="freq-mhz">—</span>
+        <span class="freq-unit">MHz</span>
+        <span id="band-pill" class="band-pill" hidden></span>
     </div>
+
+    <!-- Applied live config — populated by app.js (3 compact rows). -->
+    <div id="applied-settings">waiting for first frame…</div>
 
     <div id="statusbar">
         <span class="status-pill">
@@ -33,160 +38,140 @@
             <span id="status-text">connecting…</span>
         </span>
         <span id="role-badge" class="role-badge" hidden></span>
+
+        <div class="mode-switch" role="group" aria-label="Interface mode">
+            <button type="button" class="mode-opt" data-mode="pro">DAN</button>
+            <button type="button" class="mode-opt" data-mode="noob">ARIC</button>
+        </div>
+
         <button id="signout-btn" type="button" title="Sign out / switch user" hidden>
             Sign out
         </button>
     </div>
-
-    <button id="ctrl-toggle" class="pro-only" type="button" aria-expanded="true" aria-controls="controls">
-        Controls
-    </button>
 </header>
 
-<!-- ── Controls ──────────────────────────────────────────────────────────── -->
-<div id="controls">
-
-    <div class="ctrl-group" id="disp-ctrl">
-        <span class="group-label">Display</span>
-
-        <button id="pause-btn">Pause</button>
-
-        <label>Mode
-            <select id="mode-sel">
-                <option value="replace" selected>Boring Mode 🥱</option>
-                <option value="scroll">Cool Mode 😎</option>
-            </select>
-        </label>
-
-        <label>Analysis
-            <select id="analysis-sel">
-                <option value="spectrogram" selected>Spectrogram</option>
-                <option value="quicklook">Quicklook (raw FFT)</option>
-                <option value="psd">PSD view</option>
-                <option value="ssb">SSB spectrogram</option>
-            </select>
-        </label>
-
-        <label title="Displayed time span — drives the number of waterfall rows">Duration (ms)
-            <select id="dur-sel">
-                <option value="2">2</option>
-                <option value="5">5</option>
-                <option value="10">10</option>
-                <option value="20" selected>20</option>
-                <option value="50">50</option>
-                <option value="100">100</option>
-                <option value="custom" class="pro-only">custom…</option>
-            </select>
-        </label>
-        <label class="pro-only" id="dur-custom-label" style="display:none">Custom (ms)
-            <input type="number" id="dur-custom" min="1" step="1" value="20">
-        </label>
-
-        <label class="pro-only" title="Cap the browser render rate (drops excess frames)">Max fps
-            <select id="fps-sel">
-                <option value="15" selected>15</option>
-                <option value="10">10</option>
-                <option value="5">5</option>
-                <option value="2">2</option>
-                <option value="1">1</option>
-            </select>
-        </label>
-
-        <label class="check pro-only"><input type="checkbox" id="auto-color" checked> Auto color</label>
-        <label class="check pro-only" title="Blank the LO leakage region at band center (calibrated/SSB only)"><input type="checkbox" id="lo-null" checked> LO null</label>
-        <label class="check pro-only"><input type="checkbox" id="abs-rf"    checked> Absolute RF</label>
-
-        <button id="reset-radio-btn" class="pro-only admin-only" title="Restart the radio-web service (all viewers briefly disconnect)">Reset Radio</button>
-        <button id="csv-btn" class="pro-only">Save PSD CSV</button>
-        <button id="png-btn" class="pro-only">Export PNG</button>
+<!-- ══ LEFT INSPECTOR RAIL ══════════════════════════════════════════════════ -->
+<aside id="rail">
+    <!-- tabs (plain divs, not buttons, so the read-only guard never blocks them) -->
+    <div class="rail-tabs" role="tablist">
+        <div class="rail-tab active" data-tab="display" role="tab">DISPLAY</div>
+        <div class="rail-tab pro-only" data-tab="psd" role="tab">PSD</div>
+        <div class="rail-tab pro-only" data-tab="capture" role="tab">CAPTURE</div>
     </div>
 
-    <div class="ctrl-group pro-only" id="psd-ctrl">
-        <span class="group-label">PSD tools</span>
-
-        <label class="check"><input type="checkbox" id="diff-chk">  RX1−RX2 diff</label>
-        <label class="check"><input type="checkbox" id="peak-chk" checked> Peak marker</label>
-        <label class="check"><input type="checkbox" id="hold-chk">  Peak hold</label>
-        <button id="clear-hold-btn">Clear hold</button>
-        <label class="check"><input type="checkbox" id="min-chk">   Min trace</label>
-        <label class="check"><input type="checkbox" id="cross-chk" checked> Crosshair</label>
-
-        <label>Y span (dB)
-            <select id="yspan-sel">
-                <option value="auto" selected>Auto</option>
-                <option value="10">10</option>
-                <option value="20">20</option>
-                <option value="40">40</option>
-                <option value="60">60</option>
-            </select>
-        </label>
-    </div>
-
-</div><!-- #controls -->
-
-<section class="panel pro-only" id="settings-panel">
-    <div class="panel-head">
-        <h2>Capture settings</h2>
-        <div class="legend-key">
-            <label class="file-label">Load JSON <input type="file" id="settings-upload" accept="application/json,.json"></label>
-            <button id="settings-apply" type="button">Apply</button>
-        </div>
-    </div>
-    <div id="settings-editor">
-        <div class="settings-col">
-            <h3>Capture</h3>
-            <!-- FFT size is a spectrogram control, not a SoapyCapture field, so it
-                 lives here as a static control (outside the schema-rendered form,
-                 which is cleared on every reload). Sends {nfft} — snapped +
-                 validated server-side. Former home was the deleted Radio bar. -->
-            <div class="settings-grid settings-static">
-                <label>FFT size
-                    <select id="nfft-sel">
-                        <option value="256">256</option>
-                        <option value="512">512</option>
-                        <option value="1024" selected>1024</option>
-                        <option value="2048">2048</option>
-                        <option value="4096">4096</option>
-                    </select>
-                </label>
+    <div class="rail-scroll">
+        <!-- ── DISPLAY panel ────────────────────────────────────────────── -->
+        <section class="rail-panel active" data-panel="display">
+            <div class="btn-row">
+                <button id="pause-btn">⏸ Pause</button>
+                <button id="csv-btn" class="pro-only">Save CSV</button>
+                <button id="png-btn" class="pro-only">Export PNG</button>
             </div>
-            <div id="capture-settings-form" class="settings-grid"></div>
-        </div>
-        <div class="settings-col">
-            <h3>Source <span class="reconnect-badge">requires reconnect — not applied live</span></h3>
-            <div id="source-settings-form" class="settings-grid"></div>
-        </div>
-        <!-- Analysis (P2a-6, per-analysis panels P2b-6): DAN-mode only (the
-             whole #settings-panel is pro-only). The fields are rendered by
-             app.js for the analysis currently selected in the Analysis
-             dropdown (spectrogram / PSD / SSB), matching the intent that the
-             config targets the shown analysis. Free-text inputs by design —
-             the freedom model on the server snaps knowable constraints
-             (reported as "invalid X → using Y") and scratch-validates the rest
-             with striqt before the live stream ever sees a new value. Values
-             seed from /config, so Apply re-sends only what you actually edit. -->
-        <div class="settings-col" id="analysis-col">
-            <h3>Analysis <span class="analysis-badge" id="analysis-badge"></span></h3>
-            <div id="analysis-form" class="settings-grid settings-static"></div>
-            <button id="analysis-apply" type="button">Apply analysis</button>
-        </div>
-    </div>
-</section>
 
-<!-- ── Main dashboard ────────────────────────────────────────────────────── -->
+            <label class="ctrl-row">Mode
+                <select id="mode-sel">
+                    <option value="replace" selected>Boring 🥱</option>
+                    <option value="scroll">Cool 😎</option>
+                </select>
+            </label>
+
+            <label class="ctrl-row">Analysis
+                <select id="analysis-sel">
+                    <option value="spectrogram" selected>Spectrogram</option>
+                    <option value="quicklook">Quicklook (raw FFT)</option>
+                    <option value="psd">PSD view</option>
+                    <option value="ssb">SSB spectrogram</option>
+                </select>
+            </label>
+
+            <label class="ctrl-row" title="Displayed time span — drives the number of waterfall rows">Duration (ms)
+                <select id="dur-sel">
+                    <option value="2">2</option>
+                    <option value="5">5</option>
+                    <option value="10">10</option>
+                    <option value="20" selected>20</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                    <option value="custom" class="pro-only">custom…</option>
+                </select>
+            </label>
+            <label class="ctrl-row pro-only" id="dur-custom-label" style="display:none">Custom (ms)
+                <input type="number" id="dur-custom" min="1" step="1" value="20">
+            </label>
+
+            <label class="ctrl-row pro-only" title="Cap the browser render rate (drops excess frames)">Max fps
+                <select id="fps-sel">
+                    <option value="15" selected>15</option>
+                    <option value="10">10</option>
+                    <option value="5">5</option>
+                    <option value="2">2</option>
+                    <option value="1">1</option>
+                </select>
+            </label>
+
+            <label class="ctrl-row check pro-only"><span>Auto color</span><input type="checkbox" id="auto-color" checked></label>
+            <label class="ctrl-row check pro-only" title="Blank the LO leakage region at band center (calibrated/SSB only)"><span>LO null</span><input type="checkbox" id="lo-null" checked></label>
+            <label class="ctrl-row check pro-only"><span>Absolute RF</span><input type="checkbox" id="abs-rf" checked></label>
+
+            <button id="reset-radio-btn" class="rail-danger pro-only admin-only" title="Restart the radio-web service (all viewers briefly disconnect)">Reset Radio</button>
+        </section>
+
+        <!-- ── PSD panel ────────────────────────────────────────────────── -->
+        <section class="rail-panel pro-only" data-panel="psd">
+            <label class="ctrl-row check"><span>RX1−RX2 diff</span><input type="checkbox" id="diff-chk"></label>
+            <label class="ctrl-row check"><span>Peak marker</span><input type="checkbox" id="peak-chk" checked></label>
+            <label class="ctrl-row check"><span>Peak hold</span><input type="checkbox" id="hold-chk"></label>
+            <button id="clear-hold-btn">Clear hold</button>
+            <label class="ctrl-row check"><span>Min trace</span><input type="checkbox" id="min-chk"></label>
+            <label class="ctrl-row check"><span>Crosshair</span><input type="checkbox" id="cross-chk" checked></label>
+
+            <label class="ctrl-row">Y span (dB)
+                <select id="yspan-sel">
+                    <option value="auto" selected>Auto</option>
+                    <option value="10">10</option>
+                    <option value="20">20</option>
+                    <option value="40">40</option>
+                    <option value="60">60</option>
+                </select>
+            </label>
+        </section>
+
+        <!-- ── CAPTURE panel (settings) ─────────────────────────────────── -->
+        <section class="rail-panel pro-only" data-panel="capture" id="settings-panel">
+            <div class="settings-head">
+                <label class="file-label">Load JSON <input type="file" id="settings-upload" accept="application/json,.json"></label>
+                <button id="settings-apply" type="button">Apply</button>
+            </div>
+
+            <h3 class="settings-h">Capture</h3>
+            <label class="ctrl-row">FFT size
+                <select id="nfft-sel">
+                    <option value="256">256</option>
+                    <option value="512">512</option>
+                    <option value="1024" selected>1024</option>
+                    <option value="2048">2048</option>
+                    <option value="4096">4096</option>
+                </select>
+            </label>
+            <div id="capture-settings-form" class="settings-grid"></div>
+
+            <h3 class="settings-h">Source <span class="reconnect-badge">requires reconnect</span></h3>
+            <div id="source-settings-form" class="settings-grid"></div>
+
+            <h3 class="settings-h">Analysis <span class="analysis-badge" id="analysis-badge"></span></h3>
+            <div id="analysis-form" class="settings-grid"></div>
+            <button id="analysis-apply" type="button">Apply analysis</button>
+        </section>
+    </div>
+
+    <!-- ── BAND MONITOR (black, multi-value) — filled by app.js ─────────── -->
+    <div id="band-monitor">Band monitor: --</div>
+</aside>
+
+<!-- ══ MAIN DASHBOARD ═══════════════════════════════════════════════════════ -->
 <main id="dashboard">
 
-    <!-- Applied settings: the live radio/display config, moved out of the header
-         (which truncated it) into a full-width band that scrolls horizontally so
-         the whole string is always readable on mobile and desktop. -->
-    <section class="panel" id="applied-panel">
-        <div class="panel-head">
-            <h2>Applied settings</h2>
-        </div>
-        <div id="applied-settings">waiting for first frame…</div>
-    </section>
-
-    <!-- Noob frequency tuner (NOOB mode only) -->
+    <!-- Noob frequency tuner (ARIC mode only) -->
     <section class="panel noob-only" id="noob-tuner">
         <div class="panel-head">
             <h2>Tune to a station</h2>
@@ -195,18 +180,7 @@
         <div id="noob-freq-groups"></div>
     </section>
 
-    <!-- Band power monitor -->
-    <section class="panel pro-only" id="band-panel">
-        <div class="panel-head">
-            <h2>Band monitor</h2>
-            <span class="panel-hint"></span>
-        </div>
-        <div id="band-monitor">Band monitor: --</div>
-    </section>
-
-    <!-- Waterfalls — one pane per channel, cloned from the template by
-         app.js ensureChannels() so the layout follows the frame header's
-         channel list (P3-4). -->
+    <!-- Waterfalls — one pane per channel (cloned from template by app.js) -->
     <section id="waterfall-row"></section>
     <template id="wf-pane-tpl">
         <div class="wf-pane">
@@ -229,7 +203,6 @@
         </div>
         <div id="psd-container">
             <div id="psd-plot"></div>
-            <!-- band selection overlay rendered by app.js -->
             <canvas id="band-canvas"></canvas>
         </div>
     </section>
@@ -243,50 +216,47 @@
     </section>
 
 </main>
-<!-- ── Footer ────────────────────────────────────────────────────────────── -->
+
+<!-- ══ FOOTER ═══════════════════════════════════════════════════════════════ -->
 <footer id="app-footer">
     <span class="footer-credit">Built by <strong>Mustafa Omran</strong> · 2026 NIST SURF Fellow · Communications Technology Laboratory</span>
     <span class="footer-restrict">For authorized NIST users only</span>
 </footer>
 
-<!-- ── Access-denied popup (shown to read-only roles on any control) ──────── -->
+<!-- Access-denied popup (shown to read-only roles on any control) -->
 <div id="access-denied" role="alert" aria-live="assertive" hidden></div>
 
-<!-- ── Scripts ───────────────────────────────────────────────────────────── -->
+<!-- ══ SCRIPTS ══════════════════════════════════════════════════════════════ -->
 <script src="colormap.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <script src="app.js"></script>
 
-<!-- Controls collapse toggle (layout only — does not touch data/functionality) -->
+<!-- Rail tab switching (layout only — plain divs, never sends control) -->
 <script>
 (function () {
-    var toggle   = document.getElementById("ctrl-toggle");
-    var controls = document.getElementById("controls");
-    var mq       = window.matchMedia("(max-width: 760px)");
-
-    function setOpen(open) {
-        controls.classList.toggle("collapsed", !open);
-        toggle.setAttribute("aria-expanded", String(open));
+    var tabs   = Array.prototype.slice.call(document.querySelectorAll(".rail-tab"));
+    var panels = Array.prototype.slice.call(document.querySelectorAll(".rail-panel"));
+    function select(name) {
+        tabs.forEach(function (t) { t.classList.toggle("active", t.dataset.tab === name); });
+        panels.forEach(function (p) { p.classList.toggle("active", p.dataset.panel === name); });
     }
-    // Collapsed by default on small screens, open on desktop.
-    function applyDefault() { setOpen(!mq.matches); }
-    applyDefault();
-    mq.addEventListener("change", applyDefault);
-
-    toggle.addEventListener("click", function () {
-        setOpen(controls.classList.contains("collapsed"));
+    tabs.forEach(function (t) {
+        t.addEventListener("click", function () {
+            // Ignore clicks on tabs hidden in the current mode (pro-only in ARIC).
+            if (getComputedStyle(t).display === "none") return;
+            select(t.dataset.tab);
+        });
     });
 })();
 </script>
 
-<!-- PRO / NOOB mode switch + NOOB station tuner (front-end only — sends the
-     same { center } control the "Apply" button uses; no radio code changes) -->
+<!-- PRO/NOOB (DAN/ARIC) mode switch + NOOB station tuner (front-end only —
+     sends the same { center } control the tuner chips use; no radio code changes) -->
 <script>
 (function () {
     var STORAGE_KEY = "viewerMode";
-    var body       = document.body;
-    var modeBtns   = document.querySelectorAll(".mode-opt");
-    var controls   = document.getElementById("controls");
+    var body     = document.body;
+    var modeBtns = document.querySelectorAll(".mode-opt");
 
     function applyMode(mode) {
         var noob = mode === "noob";
@@ -297,9 +267,11 @@
             b.classList.toggle("active", on);
             b.setAttribute("aria-pressed", String(on));
         });
-        // NOOB has only a couple of controls — never keep them collapsed.
-        if (noob && controls) controls.classList.remove("collapsed");
-        try { localStorage.setItem(STORAGE_KEY, mode); } catch (e) {}
+        // In ARIC mode the PSD/Capture tabs are hidden — make sure Display shows.
+        if (noob) {
+            var disp = document.querySelector('.rail-tab[data-tab="display"]');
+            if (disp) disp.click();
+        }
     }
 
     modeBtns.forEach(function (b) {
@@ -309,11 +281,13 @@
     var saved = "pro";
     try { saved = localStorage.getItem(STORAGE_KEY) || "pro"; } catch (e) {}
     applyMode(saved);
+    modeBtns.forEach(function (b) {
+        b.addEventListener("click", function () {
+            try { localStorage.setItem(STORAGE_KEY, b.dataset.mode); } catch (e) {}
+        });
+    });
 
     // ── Station presets ──────────────────────────────────────────────────
-    // Each entry: human label + a single center frequency (MHz) to tune to.
-    // For a band/range we use a representative center. Anything outside the
-    // radio's 300 MHz – 6 GHz tuning range is shown but disabled.
     var FREQ_GROUPS = [
         { name: "Broadcast & VHF", items: [
             { label: "FM broadcast radio",      mhz: 98 },
