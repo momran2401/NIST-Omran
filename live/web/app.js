@@ -50,6 +50,7 @@ const DENY_MESSAGES = {
 // Current frame metadata (updated on each frame)
 let curCenter   = 1955e6;
 let curFs       = 15.36e6;
+let curGain     = null;     // header "gain" (dB) — shown in the applied-config readout
 let radioNfft   = 1024;     // requested radio FFT size (from #nfft-sel); NEVER set from frame headers
 let curBins     = 1024;     // bins in the current frame's blocks (from header "nfft")
 let curRows     = 12;
@@ -117,6 +118,9 @@ function updateDeviceLabel(label) {
     // name and channel count live in the Applied Settings band via updateMeta().
     // We still set the browser tab title so the device is identifiable there.
     document.title = `${label} · SDR LIVE Viewer`;
+    // Brand sub-line in the header shows the live device + channel count.
+    const brandSub = document.getElementById("brand-device");
+    if (brandSub) brandSub.textContent = n ? `${label} · ${n}ch` : label;
 }
 
 function firstWfBuf() {
@@ -165,10 +169,40 @@ function logMsg(msg, level = "INFO") {
 // ---------------------------------------------------------------------------
 
 const statusEl = document.getElementById("status-text");
-// The applied-settings readout moved out of the (truncating) header into a
-// dedicated full-width band below the controls (see #applied-settings), so the
-// whole string is always readable and scrolls instead of clipping.
 const metaEl   = document.getElementById("applied-settings");
+const freqMhzEl  = document.getElementById("freq-mhz");
+const bandPillEl = document.getElementById("band-pill");
+let   metaKey    = null;   // change-key so the applied-config DOM only rebuilds on change
+
+// Best-effort RF band label for the header pill. Ranges are approximate
+// (downlink-centric) and only cover common, recognizable allocations; returns
+// null when the center frequency isn't in a known band (pill stays hidden).
+function bandName(mhz) {
+    const B = [
+        [88, 108,   "FM broadcast"],
+        [174, 216,  "VHF-Hi TV"],
+        [470, 698,  "UHF TV"],
+        [617, 652,  "n71 \u00b7 600"],
+        [728, 757,  "700 MHz"],
+        [758, 768,  "n14 \u00b7 FirstNet"],
+        [869, 894,  "Band 5 \u00b7 850"],
+        [1176, 1177,"GPS L5"],
+        [1227, 1228,"GPS L2"],
+        [1559, 1610,"GNSS L1"],
+        [1805, 1880,"Band 3 \u00b7 1800"],
+        [1930, 1995,"Band 2/25 \u00b7 PCS"],
+        [2110, 2200,"Band 4/66 \u00b7 AWS"],
+        [2300, 2400,"Band 30 \u00b7 WCS"],
+        [2400, 2500,"2.4 GHz ISM"],
+        [2496, 2690,"Band 41 \u00b7 n41"],
+        [3300, 3550,"n77 \u00b7 3.4"],
+        [3550, 3700,"n48 \u00b7 CBRS"],
+        [3700, 3980,"n77 \u00b7 C-band"],
+        [5150, 5895,"5 GHz Wi-Fi"],
+    ];
+    for (const [lo, hi, name] of B) if (mhz >= lo && mhz <= hi) return name;
+    return null;
+}
 
 function setStatus(text, cls = "") {
     statusEl.textContent = text;
@@ -193,14 +227,51 @@ function updateMeta() {
     const winLabel  = (serverStats && curSpanMs != null)
         ? `integration ${curSpanMs.toFixed(0)} ms (${serverStats.map(statLabel).join("/")})`
         : `window ${winMs} ms (${depthRows} rows)`;
-    metaEl.textContent = (
-        (curDevice ? `${curDevice} | ` : "") +
-        `LIVE | center ${(curCenter / 1e6).toFixed(3)} MHz | ` +
-        `span ${(curFs / 1e6).toFixed(2)} MS/s | ` +
-        `FFT ${fftLabel} | ${analysis} | ${mode} | ${winLabel} | ` +
-        `scale ${scale} [${levels[0].toFixed(0)}, ${levels[1].toFixed(0)}] | ` +
-        `${absRF ? "absolute RF" : "baseband"} | ${renderedFps.toFixed(0)} fps`
-    );
+    // ── Header: big frequency readout + band pill ─────────────────────────
+    const centerMHz = curCenter / 1e6;
+    if (freqMhzEl) freqMhzEl.textContent = centerMHz.toFixed(3);
+    if (bandPillEl) {
+        const bn = bandName(centerMHz);
+        bandPillEl.hidden = !bn;
+        if (bn) bandPillEl.textContent = bn;
+    }
+
+    // ── Applied-config rows (rebuilt only when a value changes) ───────────
+    const fftTxt   = curBackend === "quicklook" ? `${radioNfft}` : `${radioNfft}\u2192${curFftNfft}`;
+    const freqResHz = curFs / (curFftNfft || curBins);
+    const freqResTxt = freqResHz >= 1e3
+        ? (freqResHz / 1e3).toFixed(3).replace(/0+$/, "").replace(/\.$/, "") + " kHz"
+        : freqResHz.toFixed(1) + " Hz";
+    const durTxt = (serverStats && curSpanMs != null)
+        ? `${curSpanMs.toFixed(0)} ms int` : `${winMs} ms`;
+    const chTxt  = (channelList || []).map((_, i) => `RX${i + 1}`).join("+") || "\u2014";
+    const rfTxt  = absRF ? "absolute" : "baseband";
+    const gainTxt = (curGain !== null && curGain !== undefined) ? `${curGain} dB` : "\u2014";
+    const loEl   = document.getElementById("lo-null");
+    const loOn   = !!(loEl && loEl.checked);
+    const key = [centerMHz, curFs, gainTxt, fftTxt, freqResTxt, depthRows, durTxt,
+                 analysis, mode, scale, levels[0].toFixed(0), levels[1].toFixed(0),
+                 rfTxt, chTxt, loOn, renderedFps.toFixed(0)].join("|");
+    if (key !== metaKey) {
+        metaKey = key;
+        const F = (k, v) => `<span><span class="ap-k">${k} </span>${v}</span>`;
+        metaEl.className = "";
+        metaEl.innerHTML =
+            `<div class="ap-row">` +
+                F("rate", (curFs / 1e6).toFixed(2) + " MS/s") + F("gain", gainTxt) +
+                F("fft", fftTxt) + F("freq-res", freqResTxt) +
+            `</div>` +
+            `<div class="ap-row">` +
+                F("rows", depthRows) + F("duration", durTxt) +
+                F("analysis", analysis) + F("mode", mode) +
+            `</div>` +
+            `<div class="ap-row">` +
+                F("scale", `${scale} [${levels[0].toFixed(0)},${levels[1].toFixed(0)}]`) +
+                F("RF", rfTxt) + F("ch", chTxt) +
+                F("LO-null", loOn ? `<span class="ap-on">on</span>` : "off") +
+                F("fps", renderedFps.toFixed(0)) +
+            `</div>`;
+    }
     renderWfAxis();
 }
 
@@ -560,6 +631,7 @@ function onFrame(data) {
         resetBand(freqsMHz);
     }
     curRows = rows;
+    if (gain !== undefined && gain !== null) curGain = gain;
 
     // ── Render ────────────────────────────────────────────────────────────
     if (serverStats) {
@@ -765,6 +837,15 @@ function psdYLabel() {
         : "Integrated power (dB rel. FS)";
 }
 
+// PSD plot height follows its (flex) container so the layout can fit the viewport.
+function psdHeight() {
+    const c = document.getElementById("psd-container");
+    // Reserve room for uPlot's interactive legend below the plot so it isn't
+    // clipped by the fixed-height panel (the panel header carries the title,
+    // so uPlot's own title is hidden in CSS).
+    return Math.max(140, (c ? c.clientHeight : 312) - 12 - 46);
+}
+
 function initUplot(freqs) {
     const container = document.getElementById("psd-plot");
     container.innerHTML = "";  // clear previous instance
@@ -797,7 +878,7 @@ function initUplot(freqs) {
 
     const opts = {
         width:  w,
-        height: 300,
+        height: psdHeight(),
         title:  `Power Spectral Density (${chans.map((c, i) => rxName(i)).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -913,7 +994,7 @@ function initUplotPsdStats(freqs, stats) {
 
     const opts = {
         width:  w,
-        height: 300,
+        height: psdHeight(),
         title:  `Power Spectral Density — striqt statistics (${chans.map((_, i) => `RX${i + 1}`).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -1216,7 +1297,9 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
     const nBins = hiIdx - loIdx + 1;
 
     const chans = channelList || [0, 1];
-    const band = {}, qual = {};
+    const primary = chans[0];
+    const band = {}, qual = {}, noise = {};
+    let peakDb = -Infinity, peakIdx = loIdx;
     for (const ch of chans) {
         // PSD backend (P2b-4): no waterfall window — integrate the mean trace
         // (or the first statistic) instead of the display buffer.
@@ -1233,37 +1316,61 @@ function updateBandMonitor(channels, blocks, rows, nfft) {
         }
         if (!buf) continue;
 
-        // Correct linear-domain averaging (avoids the dB-averaging error)
+        // Correct linear-domain averaging (avoids the dB-averaging error).
         let sumInBand = 0, sumAll = 0;
         for (let r = 0; r < depth; r++) {
             const off = r * nfft;
             for (let i = 0; i < nfft; i++) {
-                const lin = Math.pow(10, buf[off + i] / 10);
+                const v   = buf[off + i];
+                const lin = Math.pow(10, v / 10);
                 sumAll += lin;
-                if (i >= loIdx && i <= hiIdx) sumInBand += lin;
+                if (i >= loIdx && i <= hiIdx) {
+                    sumInBand += lin;
+                    if (ch === primary && v > peakDb) { peakDb = v; peakIdx = i; }
+                }
             }
         }
         const linBand = sumInBand / (nBins * depth);
-        const linAll  = sumAll    / (nfft        * depth);
-        band[ch] = 10 * Math.log10(Math.max(linBand, 1e-20));
-        qual[ch] = 10 * Math.log10(Math.max(linBand, 1e-20))
-                 - 10 * Math.log10(Math.max(linAll,  1e-20));
+        const linAll  = sumAll    / (nfft  * depth);
+        const nOut    = (nfft - nBins) * depth;
+        const linOut  = nOut > 0 ? (sumAll - sumInBand) / nOut : linAll;
+        band[ch]  = 10 * Math.log10(Math.max(linBand, 1e-20));
+        qual[ch]  = band[ch] - 10 * Math.log10(Math.max(linAll, 1e-20));
+        noise[ch] = 10 * Math.log10(Math.max(linOut, 1e-20));
     }
 
-    const segs = [`Band ${lo.toFixed(3)}–${hi.toFixed(3)} MHz (${nBins} bins)`];
-    chans.forEach((ch, i) => {
-        if (band[ch] !== undefined) segs.push(`RX${i + 1} ${band[ch].toFixed(1)} dB`);
-    });
-    // Channel delta / relative quality only make sense as a pair — shown with
-    // exactly two channels (the classic AIR-T RX1/RX2 view).
-    if (chans.length === 2) {
-        const [a, b] = chans;
-        if (band[a] !== undefined && band[b] !== undefined) {
-            segs.push(`Δ ${(band[a] - band[b]).toFixed(1)} dB`);
-            segs.push(`Q RX1 ${qual[a] >= 0 ? "+" : ""}${qual[a].toFixed(1)} RX2 ${qual[b] >= 0 ? "+" : ""}${qual[b].toFixed(1)} dB`);
-        }
+    if (band[primary] === undefined) {
+        bandMonitorEl.textContent = "Band monitor: --";
+        return;
     }
-    bandMonitorEl.textContent = segs.join("   |   ");
+
+    // Uncalibrated dB rel. FS — honest units (quicklook is per-bin).
+    const unit    = curBackend === "quicklook" ? "dB/bin" : "dB";
+    const bandDb   = band[primary];
+    const rx2      = chans[1];
+    const peakFreq = freqsMHz[peakIdx];
+    const pct = Math.max(0, Math.min(100, (bandDb + 100) / 80 * 100));   // -100..-20 dB → 0..100%
+    const num = (x, u) => (x === undefined || !isFinite(x))
+        ? "\u2014" : `${x.toFixed(1)}<small> ${u || unit}</small>`;
+    const V = (k, v, col) =>
+        `<div><div class="bm-k">${k}</div><div class="bm-v"${col ? ` style="color:${col}"` : ""}>${v}</div></div>`;
+
+    bandMonitorEl.textContent = "";
+    bandMonitorEl.innerHTML =
+        `<div class="bm-head"><span class="bm-title">BAND MONITOR</span>` +
+        `<span class="bm-span">${lo.toFixed(1)}\u2013${hi.toFixed(1)} MHz \u00b7 ${nBins} bins</span></div>` +
+        `<div class="bm-big"><b>${bandDb.toFixed(1)}</b><span>${unit} in band</span></div>` +
+        `<div class="bm-bar"><i style="width:${pct.toFixed(0)}%"></i></div>` +
+        `<div class="bm-grid">` +
+            V("RX1", num(band[primary]), "var(--mean)") +
+            V("RX2", rx2 !== undefined ? num(band[rx2]) : "\u2014", "var(--ch2)") +
+            V("PEAK", num(peakDb), "var(--max)") +
+            V("PEAK FREQ", `${peakFreq.toFixed(2)}<small> MHz</small>`) +
+            (rx2 !== undefined
+                ? V("\u0394 RX1\u2212RX2", `${(band[primary] - band[rx2]).toFixed(1)}<small> dB</small>`)
+                : V("QUALITY", `${qual[primary] >= 0 ? "+" : ""}${qual[primary].toFixed(1)}<small> dB</small>`)) +
+            V("NOISE", num(noise[primary])) +
+        `</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,7 +1578,7 @@ function exportPng() {
 const resizeObserver = new ResizeObserver(() => {
     if (!uplot || !freqsMHz) return;
     const w = document.getElementById("psd-container").clientWidth;
-    uplot.setSize({ width: w, height: 300 });
+    uplot.setSize({ width: w, height: psdHeight() });
 });
 resizeObserver.observe(document.getElementById("psd-container"));
 
