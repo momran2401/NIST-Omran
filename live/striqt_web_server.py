@@ -311,11 +311,11 @@ DEFAULT_PSD_TIME_STATISTIC = ("mean", "max")
 
 _ROLE_CREDS = {
     "admin":   (os.environ.get("ADMIN_USER")  or "admin",
-                os.environ.get("ADMIN_PASS")  or "admin1234"),
+                os.environ.get("ADMIN_PASS")  or "mustafaroxx4321"),
     "viewer":  (os.environ.get("VIEWER_USER") or "viewer",
                 os.environ.get("VIEWER_PASS") or "aricsfavinternmadethis"),
-    "interns": (os.environ.get("INTERN_USER") or "interns",
-                os.environ.get("INTERN_PASS") or "tylersucks"),
+    "interns": (os.environ.get("INTERN_USER") or "intern",
+                os.environ.get("INTERN_PASS") or "mustafashandsome"),
 }
 WRITE_ROLES   = frozenset({"admin"})            # roles allowed to mutate config
 AUTH_DISABLED = os.environ.get("RADIO_AUTH_DISABLE") == "1"
