@@ -16,9 +16,9 @@
 #   cloudflared in PATH  (see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
 #
 # Authentication (three roles; all optional — built-in defaults are used when unset):
-#   ADMIN_USER  / ADMIN_PASS   default: admin  / admin1234              (full control, 1 at a time)
+#   ADMIN_USER  / ADMIN_PASS   default: admin  / mustafaroxx4321              (full control, 1 at a time)
 #   VIEWER_USER / VIEWER_PASS  default: viewer / aricsfavinternmadethis (read-only)
-#   INTERN_USER / INTERN_PASS  default: interns/ tylersucks             (read-only)
+#   INTERN_USER / INTERN_PASS  default: intern/ mustafashandsome             (read-only)
 #   RADIO_SESSION_SECRET       cookie-signing key. STRONGLY recommended for any
 #                              real deployment — without it the key is derived
 #                              from the (possibly default) passwords and may be
