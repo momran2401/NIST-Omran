@@ -451,7 +451,27 @@ function applyRole(role, authEnabled = true) {
 }
 
 let _denyHideTimer = null;
+let _internHideTimer = null;
+function showInternBlock() {
+    const el = document.getElementById("intern-block");
+    if (!el) return;
+    el.hidden = false;
+    // restart the CSS fade
+    el.classList.remove("show");
+    void el.offsetWidth;
+    el.classList.add("show");
+    clearTimeout(_internHideTimer);
+    _internHideTimer = setTimeout(hideInternBlock, 3000);
+}
+function hideInternBlock() {
+    const el = document.getElementById("intern-block");
+    if (!el) return;
+    el.classList.remove("show");
+    el.hidden = true;
+}
 function showAccessDenied() {
+    // Interns get a full-screen image takeover instead of the text popup.
+    if (currentRole === "interns") { showInternBlock(); return; }
     const pop = document.getElementById("access-denied");
     if (!pop) return;
     pop.textContent = DENY_MESSAGES[currentRole] || DENY_MESSAGES.viewer;
@@ -483,7 +503,7 @@ const CONTROL_SELECTOR =
 // center/rate/gain/FFT/duration/mode/analysis/LO-null/station tuner/apply/JSON —
 // changes the shared radio or other viewers and stays blocked.
 const SAFE_SELECTOR =
-    ".mode-opt, #ctrl-toggle, #signout-btn, " +
+    ".mode-opt, #ctrl-toggle, #signout-btn, #theme-toggle, " +
     "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn, #cross-chk, " +
     "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn";
 function installReadOnlyGuard() {
@@ -511,8 +531,10 @@ function installReadOnlyGuard() {
     // Dismiss the popup by clicking it or pressing Escape.
     const pop = document.getElementById("access-denied");
     if (pop) pop.addEventListener("click", hideAccessDenied);
+    const internBlock = document.getElementById("intern-block");
+    if (internBlock) internBlock.addEventListener("click", hideInternBlock);
     document.addEventListener("keydown", (ev) => {
-        if (ev.key === "Escape") hideAccessDenied();
+        if (ev.key === "Escape") { hideAccessDenied(); hideInternBlock(); }
     });
 }
 
@@ -1690,6 +1712,34 @@ document.getElementById("abs-rf").addEventListener("change", (e) => {
     resetBand(freqsMHz);
     renderWfAxis();
 });
+
+// Dark / light theme toggle. Client-only cosmetic preference, persisted in
+// localStorage so it survives reloads and reconnects. Available to every role.
+const THEME_KEY = "striqt-theme";
+function applyTheme(theme) {
+    const light = theme === "light";
+    document.body.classList.toggle("light-theme", light);
+    const btn = document.getElementById("theme-toggle");
+    if (btn) {
+        const icon  = btn.querySelector(".theme-icon");
+        const label = btn.querySelector(".theme-label");
+        if (icon)  icon.textContent  = light ? "☀️" : "🌙";
+        if (label) label.textContent = light ? "Light" : "Dark";
+    }
+}
+(function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (_) {}
+    applyTheme(saved === "light" ? "light" : "dark");
+    const btn = document.getElementById("theme-toggle");
+    if (btn) {
+        btn.addEventListener("click", () => {
+            const next = document.body.classList.contains("light-theme") ? "dark" : "light";
+            applyTheme(next);
+            try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+        });
+    }
+})();
 
 // Sign out / switch user: clear the session cookie (server-side) and land on
 // the login form, where a different role can sign in.
