@@ -34,29 +34,8 @@ developed and tested on a laptop.
 
 ---
 
-## Screenshots
-
-All captures below are **demo mode** (`--demo`, synthetic IQ) — reproduce any
-of them with zero hardware.
-
-The main dashboard (DAN mode): dual waterfalls, interactive PSD, band
-monitor, and the applied-config readout in the header —
-
-![Main dashboard](docs/img/dashboard-dan.png)
-
-Live stream (two synthetic carriers near 1955 MHz):
-
-![Live demo](docs/img/live-demo.gif)
-
-| ARIC mode — click a station to tune to it | OPS tab — every change verified end to end |
-|---|---|
-| ![Station tuner](docs/img/station-tuner-aric.png) | ![Operations tab](docs/img/ops-tab.png) |
-
----
-
 ## Contents
 
-1. [Screenshots](#screenshots)
 1. [Requirements](#requirements)
 2. [Installation](#installation)
 3. [Quick start](#quick-start)
