@@ -1,8 +1,6 @@
 # NIST-Omran — Live RF Spectrum Viewer
 
-A live RF visualization suite for software-defined radios, built for the NIST
-SURF project *“Development of visualization frontends for cellular 5G-NR
-measurements”* (Communications Technology Laboratory, Division 675).
+A live RF visualization suite for software-defined radios, built by Mustafa Omran.
 
 Point it at an SDR and it streams **real-time spectrogram waterfalls and power
 spectral density (PSD)** — one pane per RX channel — to any web browser, to a
@@ -317,7 +315,7 @@ This work was developed in connection with the NIST SURF project “Development
 of visualization frontends for cellular 5G-NR measurements.” Reuse,
 redistribution, or derivative work should be approved by the appropriate NIST
 project mentors (Dr. Aric Sanders & Dr. Dan Kuester) and the repository
-maintainer before use outside the intended NIST research context.
+maintainer (Mustafa Omran) before use outside the intended NIST research context.
 
 This repository is currently not licensed for public reuse. Unless a separate
 license is added, all rights are reserved for the project-specific code in
