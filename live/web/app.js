@@ -31,6 +31,7 @@ let peakMarker  = true;
 let peakHold    = false;
 let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
+let psdZoomX    = null;     // null = live follow (auto x); {min,max} = user zoom/pan
 let windowMs    = 20;
 let analysisMode = "spectrogram";
 let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
@@ -376,6 +377,7 @@ function connect() {
                     }
                     return;
                 }
+                if (msg.op) { handleOpEvent(msg.op); return; }
                 if (msg.message && msg.message !== "ping") logMsg(msg.message);
                 if (msg.ack) {
                     handleAck(msg.ack);
@@ -448,6 +450,7 @@ function applyRole(role, authEnabled = true) {
     const signout = document.getElementById("signout-btn");
     if (signout) signout.hidden = !authEnabled;
     logMsg(`Signed in as '${role}'${isAdmin ? " (full control)" : " (read-only)"}`);
+    if (isAdmin && typeof connectJournal === "function") connectJournal();
 }
 
 let _denyHideTimer = null;
@@ -505,7 +508,8 @@ const CONTROL_SELECTOR =
 const SAFE_SELECTOR =
     ".mode-opt, #ctrl-toggle, #signout-btn, #theme-toggle, " +
     "#peak-chk, #hold-chk, #diff-chk, #min-chk, #clear-hold-btn, #cross-chk, " +
-    "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn";
+    "#yspan-sel, #pause-btn, #fps-sel, #auto-color, #abs-rf, #csv-btn, #png-btn, " +
+    "#ops-refresh";
 function installReadOnlyGuard() {
     const block = (ev) => {
         if (!currentRole || isAdmin) return;              // admin or not-yet-known
@@ -563,6 +567,159 @@ function handleAck(ack) {
     } else if (rounded.length) {
         setStatus(`adjusted ${rounded.map((r) => r.field).join(", ")} to legal values`, "warn");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Operations tab — the verified-operations pipeline, live + history
+// ---------------------------------------------------------------------------
+//
+// Every radio-affecting action (config change, radio open/rearm, reset) is an
+// Operation on the server: requested → validated → applying → readback →
+// data-path → verdict. Stage events stream over the WebSocket as {"op": ...}
+// and accumulate here; /operations backfills history for late joiners.
+
+const OPS_LIMIT = 50;
+const opsEntries = new Map();   // op_id -> {root, stagesEl, stateEl}
+const OP_TERMINAL = new Set(["SUCCESS", "VERIFIED", "UNVERIFIED", "MISMATCH", "FAILED", "SUPERSEDED"]);
+
+function opStateClass(state) {
+    if (state === "failed" || state === "mismatch") return "op-bad";
+    if (state === "unverified") return "op-warn";
+    if (state === "running") return "op-running";
+    if (state === "superseded") return "op-dim";
+    return "op-ok";
+}
+
+function ensureOpEntry(opId, kind, summary) {
+    let e = opsEntries.get(opId);
+    if (e) return e;
+    const list = document.getElementById("ops-list");
+    if (!list) return null;
+    const root = document.createElement("div");
+    root.className = "op-entry";
+    root.innerHTML =
+        `<div class="op-head"><span class="op-id">#${opId}</span>` +
+        `<span class="op-kind"></span>` +
+        `<span class="op-state op-running">running</span></div>` +
+        `<div class="op-summary"></div><div class="op-stages"></div>`;
+    root.querySelector(".op-kind").textContent = kind || "";
+    root.querySelector(".op-summary").textContent = summary || "";
+    list.prepend(root);
+    while (list.children.length > OPS_LIMIT) list.removeChild(list.lastChild);
+    e = { root, stagesEl: root.querySelector(".op-stages"),
+          stateEl: root.querySelector(".op-state") };
+    opsEntries.set(opId, e);
+    if (opsEntries.size > OPS_LIMIT * 2) {
+        for (const [k, v] of opsEntries) {
+            if (!v.root.isConnected) opsEntries.delete(k);
+        }
+    }
+    return e;
+}
+
+function appendOpStage(e, stage, detail, level) {
+    const line = document.createElement("div");
+    line.className = `op-stage op-lvl-${level || "info"}`;
+    line.textContent = `${stage}${detail ? ": " + detail : ""}`;
+    e.stagesEl.appendChild(line);
+}
+
+function handleOpEvent(ev) {
+    const e = ensureOpEntry(ev.op_id, ev.kind,
+                            ev.stage === "requested" ? ev.detail : null);
+    if (!e) return;
+    if (ev.stage === "requested" && ev.detail) {
+        e.root.querySelector(".op-summary").textContent = ev.detail;
+    }
+    appendOpStage(e, ev.stage, ev.detail, ev.level);
+    if (OP_TERMINAL.has(ev.stage)) {
+        const state = ev.stage.toLowerCase();
+        e.stateEl.textContent = state;
+        e.stateEl.className = "op-state " + opStateClass(state);
+        const lvl = state === "failed" ? "ERROR"
+                  : (state === "mismatch" || state === "unverified") ? "WARN" : null;
+        if (lvl) logMsg(`[op #${ev.op_id}] ${ev.stage}: ${ev.detail || ""}`, lvl);
+    }
+}
+
+function renderOpsFromHistory(ops) {
+    const list = document.getElementById("ops-list");
+    if (!list) return;
+    list.textContent = "";
+    opsEntries.clear();
+    for (const op of ops) {          // oldest→newest; prepend puts newest on top
+        const e = ensureOpEntry(op.id, op.kind, op.summary);
+        if (!e) continue;
+        for (const st of op.stages || []) appendOpStage(e, st.stage, st.detail, st.level);
+        e.stateEl.textContent = op.state;
+        e.stateEl.className = "op-state " + opStateClass(op.state);
+    }
+}
+
+function fmtUptime(sec) {
+    if (sec == null) return "—";
+    if (sec < 90) return sec.toFixed(0) + " s";
+    if (sec < 5400) return (sec / 60).toFixed(0) + " min";
+    return (sec / 3600).toFixed(1) + " h";
+}
+
+function renderOpsHealth(h) {
+    const el = document.getElementById("ops-health");
+    if (!el || !h) return;
+    const radio = h.radio
+        ? `radio ${h.radio.open ? "open" : "CLOSED"} · ring ${(100 * (h.radio.ring_fill || 0)).toFixed(0)}%`
+        : "synthetic source (demo)";
+    el.innerHTML =
+        `<span class="oph ${h.status === "ok" ? "oph-ok" : "oph-warn"}"></span>` +
+        `<span class="oph-status"></span> · <span class="oph-dev"></span>` +
+        `<br>boot ${String(h.boot_id || "").slice(0, 8)} · up ${fmtUptime(h.uptime_s)}` +
+        `<br>${radio}` +
+        `<br>last frame ${h.last_frame_age_s != null ? h.last_frame_age_s.toFixed(1) + " s ago" : "—"}`;
+    el.querySelector(".oph-status").textContent = h.status;
+    el.querySelector(".oph-dev").textContent = h.device ? h.device.label : "";
+}
+
+async function refreshOps() {
+    try {
+        const r = await fetch("/operations", { cache: "no-store" });
+        if (r.ok) renderOpsFromHistory((await r.json()).operations || []);
+    } catch (_) {}
+    try {
+        const r = await fetch("/health", { cache: "no-store" });
+        if (r.ok) renderOpsHealth(await r.json());
+    } catch (_) {}
+}
+
+(function initOpsTab() {
+    const tab = document.querySelector('.rail-tab[data-tab="ops"]');
+    if (tab) tab.addEventListener("click", refreshOps);
+    const btn = document.getElementById("ops-refresh");
+    if (btn) btn.addEventListener("click", refreshOps);
+    setTimeout(refreshOps, 800);   // backfill ops that predate this page load
+})();
+
+// ── Service journal tail (admin only): journalctl over /ws/logs ──────────
+let journalWs = null;
+function connectJournal() {
+    const pre = document.getElementById("ops-journal");
+    if (!isAdmin || !pre || (journalWs && journalWs.readyState <= WebSocket.OPEN)) return;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    journalWs = new WebSocket(`${proto}//${location.host}/ws/logs`);
+    journalWs.onopen = () => { pre.textContent = ""; };
+    journalWs.onmessage = (e) => {
+        try {
+            const msg = JSON.parse(e.data);
+            if (msg.journal === undefined) return;
+            pre.textContent += msg.journal + "\n";
+            const lines = pre.textContent.split("\n");
+            if (lines.length > 400) pre.textContent = lines.slice(-400).join("\n");
+            pre.scrollTop = pre.scrollHeight;
+        } catch (_) {}
+    };
+    journalWs.onclose = () => {
+        journalWs = null;
+        if (isAdmin) setTimeout(connectJournal, 2000);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +988,12 @@ function renderWfAxis() {
     let spans = "";
     for (let k = 0; k < 5; k++) {
         const i = Math.round((k / 4) * (n - 1));
-        spans += `<span>${freqsMHz[i].toFixed(1)} MHz</span>`;
+        const v = freqsMHz[i];
+        // Baseband (Absolute RF off) is labeled as a signed offset from the
+        // tuned center so it can never be mistaken for a mistune.
+        spans += absRF
+            ? `<span>${v.toFixed(1)} MHz</span>`
+            : `<span>Δ${v >= 0 ? "+" : ""}${v.toFixed(1)} MHz</span>`;
     }
     const buf0 = firstWfBuf();
     const depthRows = buf0 ? buf0.length / curBins : curRows;
@@ -915,7 +1077,7 @@ function initUplot(freqs) {
         },
         axes: [
             {
-                label:  "Frequency (MHz)",
+                label:  absRF ? "Frequency (MHz)" : "Offset from center (MHz)",
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -1028,7 +1190,7 @@ function initUplotPsdStats(freqs, stats) {
         scales: { x: { time: false }, y: { auto: true } },
         axes: [
             {
-                label:  "Frequency (MHz)",
+                label:  absRF ? "Frequency (MHz)" : "Offset from center (MHz)",
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -1079,7 +1241,9 @@ function renderServerPsd(channels, blocks, rows, nfft) {
             data.push(Array.from(tr));
         }
     }
-    uplot.setData(data);
+    // Preserve a user zoom/pan across incoming frames (reset only on retune
+    // via plot rebuild, or double-click). resetScales=false keeps the view.
+    uplot.setData(data, psdZoomX === null);
     psdData.server = { stats, traces };
 
     // Peak markers from the most peak-like trace (max if present, else the
@@ -1195,7 +1359,7 @@ function updatePSD(channels, blocks, rows, nfft) {
         vis.push(diffActive);
     }
 
-    uplot.setData(data);
+    uplot.setData(data, psdZoomX === null);   // keep a user zoom across frames
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
     // Peak markers (strongest bin per visible channel) — LV-U1b
@@ -1408,21 +1572,60 @@ function resetBand(freqs) {
     if (uplot) uplot.redraw();
 }
 
+// PSD interaction model (interactive-PSD):
+//   wheel        zoom the x-axis around the cursor
+//   drag         grab an existing band-monitor handle/body if hit, else PAN
+//   Shift-drag   rubber-band region zoom (uPlot's select box)
+//   Alt-drag     draw a NEW band-monitor selection
+//   double-click reset to the full span and resume live follow
+// The zoom state lives in psdZoomX; frames arriving while zoomed keep the view
+// (setData resetScales=false). A retune rebuilds the plot → zoom resets.
 function setupBandDrag() {
     if (!uplot) return;
     const over = uplot.over;   // the event-capture div over the uPlot canvas
+    psdZoomX = null;
 
     let dragStart = null;
     let origLo, origHi;
+    let panStart = null;       // {px, min, max} while panning
+    let zoomSel  = null;       // {startPx} while shift-drag region zooming
 
     // Pointer events fire for mouse, touch and pen — touch-action:none keeps a
     // drag on a phone from scrolling the page instead of moving the band.
     over.style.touchAction = "none";
 
+    function pxOf(clientX) {
+        return clientX - over.getBoundingClientRect().left;
+    }
+
     function freqAtX(clientX) {
-        const rect = over.getBoundingClientRect();
-        const px   = clientX - rect.left;
-        return uplot.posToVal(px, "x");
+        return uplot.posToVal(pxOf(clientX), "x");
+    }
+
+    function dataExtent() {
+        const xs = uplot.data && uplot.data[0];
+        if (!xs || !xs.length) return null;
+        return [xs[0], xs[xs.length - 1]];
+    }
+
+    function setZoom(min, max) {
+        const ext = dataExtent();
+        if (ext) {
+            // Clamp inside the data span; a window at (or past) full span
+            // returns to live-follow auto scaling.
+            const span = Math.min(max - min, ext[1] - ext[0]);
+            if (span >= (ext[1] - ext[0]) * 0.999) { resetZoom(); return; }
+            if (min < ext[0]) { min = ext[0]; max = ext[0] + span; }
+            if (max > ext[1]) { max = ext[1]; min = ext[1] - span; }
+        }
+        psdZoomX = { min, max };
+        uplot.setScale("x", psdZoomX);
+    }
+
+    function resetZoom() {
+        psdZoomX = null;
+        const ext = dataExtent();
+        if (ext) uplot.setScale("x", { min: ext[0], max: ext[1] });
     }
 
     function hitTest(freq) {
@@ -1438,30 +1641,73 @@ function setupBandDrag() {
 
     over.style.cursor = "crosshair";
 
+    // ── Wheel: zoom around the cursor ────────────────────────────────────
+    over.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const scale = uplot.scales.x;
+        if (scale.min == null || scale.max == null) return;
+        const v = freqAtX(e.clientX);
+        if (v == null || !isFinite(v)) return;
+        const factor = e.deltaY < 0 ? 0.8 : 1.25;
+        setZoom(v - (v - scale.min) * factor, v + (scale.max - v) * factor);
+    }, { passive: false });
+
+    // ── Double-click: full span + live follow (uPlot also auto-resets) ───
+    over.addEventListener("dblclick", () => { resetZoom(); });
+
     over.addEventListener("pointerdown", (e) => {
         if (e.button !== 0) return;
         const f = freqAtX(e.clientX);
         if (f === null) return;
-        const hit = hitTest(f);
-        if (hit) {
-            // Drag existing band
-            dragStart = f;
-            bandDrag  = hit;
-            origLo    = bandLo;
-            origHi    = bandHi;
-            over.style.cursor = hit === "body" ? "grab" : "ew-resize";
+
+        if (e.shiftKey) {
+            // Region zoom via uPlot's select box for the visuals.
+            zoomSel = { startPx: pxOf(e.clientX) };
+            uplot.setSelect({ left: zoomSel.startPx, width: 0,
+                              top: 0, height: uplot.over.clientHeight }, false);
+            over.style.cursor = "zoom-in";
         } else {
-            // Draw new band
-            bandLo = f;
-            bandHi = f;
-            bandDrag = "new";
-            dragStart = f;
+            const hit = e.altKey ? null : hitTest(f);
+            if (hit) {
+                // Drag existing band
+                dragStart = f;
+                bandDrag  = hit;
+                origLo    = bandLo;
+                origHi    = bandHi;
+                over.style.cursor = hit === "body" ? "grab" : "ew-resize";
+            } else if (e.altKey) {
+                // Draw new band (Alt-drag)
+                bandLo = f;
+                bandHi = f;
+                bandDrag = "new";
+                dragStart = f;
+            } else {
+                // Pan the zoomed view
+                const scale = uplot.scales.x;
+                panStart = { px: pxOf(e.clientX),
+                             min: scale.min, max: scale.max };
+                over.style.cursor = "grabbing";
+            }
         }
         try { over.setPointerCapture(e.pointerId); } catch (_) {}
         e.preventDefault();
     });
 
     window.addEventListener("pointermove", (e) => {
+        if (zoomSel) {
+            const px = Math.max(0, Math.min(pxOf(e.clientX), over.clientWidth));
+            uplot.setSelect({ left: Math.min(zoomSel.startPx, px),
+                              width: Math.abs(px - zoomSel.startPx),
+                              top: 0, height: uplot.over.clientHeight }, false);
+            return;
+        }
+        if (panStart) {
+            const rectW = over.clientWidth || 1;
+            const dpx   = pxOf(e.clientX) - panStart.px;
+            const dval  = dpx * (panStart.max - panStart.min) / rectW;
+            setZoom(panStart.min - dval, panStart.max - dval);
+            return;
+        }
         if (!bandDrag) return;
         const f = freqAtX(e.clientX);
         if (f === null) return;
@@ -1473,7 +1719,24 @@ function setupBandDrag() {
         if (uplot) uplot.redraw();
     });
 
-    window.addEventListener("pointerup", () => {
+    window.addEventListener("pointerup", (e) => {
+        if (zoomSel) {
+            const endPx = pxOf(e.clientX);
+            const a = Math.min(zoomSel.startPx, endPx);
+            const b = Math.max(zoomSel.startPx, endPx);
+            zoomSel = null;
+            uplot.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
+            if (b - a > 5) {
+                setZoom(uplot.posToVal(a, "x"), uplot.posToVal(b, "x"));
+            }
+            over.style.cursor = "crosshair";
+            return;
+        }
+        if (panStart) {
+            panStart = null;
+            over.style.cursor = "crosshair";
+            return;
+        }
         if (bandDrag) {
             bandDrag = null;
             over.style.cursor = "crosshair";
@@ -1750,11 +2013,62 @@ if (signoutBtn) {
     });
 }
 
-// Reset Radio (admin-only): restart the radio-web systemd service on the host.
-// This tears down the server and disconnects everyone for a few seconds; the
-// client's normal reconnect loop brings the viewer back once it's up again.
-// (uPlot restores PSD auto-scale on double-click, so no separate zoom-reset
-// button is needed anymore.)
+// Reset Radio (admin-only): restart the radio-web systemd service on the host
+// as a VERIFIED operation. The 202 only proves the restart command launched;
+// real confirmation is the /health boot_id CHANGING — that can only happen if
+// a new server process actually came up. Every phase is logged to the
+// Operations/Log surface so a failure names its stage instead of silently
+// pretending success.
+function verifyRestart(oldBootId) {
+    const startT = Date.now();
+    const timeoutMs = 60000;
+    let sawDown = false;
+    logMsg("[reset] verifying: polling /health for a new boot_id…", "WARN");
+    const timer = setInterval(async () => {
+        const elapsed = Date.now() - startT;
+        if (elapsed > timeoutMs) {
+            clearInterval(timer);
+            logMsg(
+                sawDown
+                    ? "[reset] FAILED: service went down but never came back " +
+                      "within 60 s — check `journalctl -u radio-web` on the host"
+                    : "[reset] FAILED: service never went down and boot_id " +
+                      "never changed — the restart likely did not reach this " +
+                      "server (is RADIO_SERVICE_NAME right? is the sudoers " +
+                      "rule installed?)",
+                "ERROR"
+            );
+            setStatus("reset NOT verified — see log", "err");
+            return;
+        }
+        let health = null;
+        try {
+            const r = await fetch("/health", { cache: "no-store" });
+            if (r.ok) health = await r.json();
+        } catch (_) {
+            if (!sawDown) logMsg("[reset] service went down (expected)…", "WARN");
+            sawDown = true;
+            return;
+        }
+        if (!health) { sawDown = true; return; }
+        // Known old boot_id → require a different one. Unknown (the 202 was
+        // lost mid-restart) → require we at least saw the service go down.
+        const restarted = health.boot_id &&
+            (oldBootId ? health.boot_id !== oldBootId : sawDown);
+        if (restarted) {
+            clearInterval(timer);
+            logMsg(
+                `[reset] VERIFIED: service restarted (new boot ${String(health.boot_id).slice(0, 8)}, ` +
+                `status ${health.status}, ${Math.round(elapsed / 1000)} s)`,
+                "WARN"
+            );
+            setStatus("radio restarted — reconnecting…", "warn");
+        }
+        // Same boot_id and still up: keep polling; the timeout above reports
+        // the RADIO_SERVICE_NAME mismatch case honestly.
+    }, 1000);
+}
+
 const resetRadioBtn = document.getElementById("reset-radio-btn");
 if (resetRadioBtn) {
     resetRadioBtn.addEventListener("click", () => {
@@ -1765,21 +2079,24 @@ if (resetRadioBtn) {
             "pipeline restarts."
         );
         if (!ok) return;
-        logMsg("Reset Radio requested — restarting service…", "WARN");
+        logMsg("[reset] requested — restarting service…", "WARN");
         fetch("/admin/reset-radio", { method: "POST" })
             .then((r) => r.json().then((j) => ({ status: r.status, j })))
             .then(({ status, j }) => {
                 if (status === 202) {
-                    logMsg(j.message || "restarting…", "WARN");
-                    setStatus("radio restarting — reconnecting…", "warn");
+                    logMsg(`[reset] ${j.message || "restarting…"} (op #${j.op_id})`, "WARN");
+                    setStatus("radio restarting — verifying…", "warn");
+                    verifyRestart(j.boot_id || null);
                 } else {
-                    logMsg(`Reset Radio failed (${status}): ${j.error || "unknown"}`, "ERROR");
+                    logMsg(`[reset] FAILED (${status}): ${j.error || "unknown"}`, "ERROR");
+                    setStatus("reset failed — see log", "err");
                 }
             })
             .catch((err) => {
-                // A dropped connection mid-restart is expected — the reconnect
-                // loop handles it; only log a real fetch error.
-                logMsg(`Reset Radio: ${err.message} (service may be restarting)`, "WARN");
+                // A dropped connection mid-restart is possible if the restart
+                // outraces the 202 — verification still settles it.
+                logMsg(`[reset] ${err.message} — verifying via /health anyway`, "WARN");
+                verifyRestart(null);
             });
     });
 }
@@ -1837,6 +2154,16 @@ const captureFields = [
     "center_frequency", "sample_rate", "gain", "analysis_bandwidth",
     "lo_shift", "host_resample", "backend_sample_rate",
 ];
+
+// Display units for the numeric radio knobs: shown/edited in the friendly
+// unit, converted to the wire unit (Hz / S/s) on send. Guards against the
+// classic "typed 1955 meaning MHz, server clamped 1955 Hz to the 300 MHz
+// floor" silent mistune.
+const FIELD_UNITS = {
+    center_frequency:    { unit: "MHz",  scale: 1e6 },
+    sample_rate:         { unit: "MS/s", scale: 1e6 },
+    backend_sample_rate: { unit: "MS/s (0 = track rate)", scale: 1e6 },
+};
 const sourceFields = [
     "master_clock_rate", "trigger_strobe", "signal_trigger", "array_backend",
     "calibration", "time_source", "time_sync_at", "clock_source",
@@ -1871,7 +2198,8 @@ function defaultFor(schema, fallback = "") {
 function makeField(group, name, schema, value) {
     const spec = scalarSchema(schema);
     const label = document.createElement("label");
-    label.textContent = name.replaceAll("_", " ");
+    const units = group === "capture" ? FIELD_UNITS[name] : null;
+    label.textContent = name.replaceAll("_", " ") + (units ? ` (${units.unit})` : "");
 
     let input;
     if (spec.enum) {
@@ -1898,6 +2226,11 @@ function makeField(group, name, schema, value) {
     input.dataset.group = group;
     input.dataset.field = name;
     input.dataset.type = spec.type || "";
+    if (units && input.type === "number") {
+        input.dataset.unitScale = String(units.scale);
+        if (input.min !== "") input.min = Number(input.min) / units.scale;
+        if (input.max !== "") input.max = Number(input.max) / units.scale;
+    }
     setFieldValue(input, value ?? defaultFor(spec));
     label.appendChild(input);
     return label;
@@ -1908,17 +2241,25 @@ function setFieldValue(input, value) {
     if (Array.isArray(value)) value = value.join(",");
     if (input.type === "checkbox") {
         input.checked = Boolean(value);
-    } else {
-        input.value = String(value);
+        return;
     }
+    if (input.dataset && input.dataset.unitScale && value !== "") {
+        const n = Number(value);
+        if (isFinite(n)) value = n / Number(input.dataset.unitScale);
+    }
+    input.value = String(value);
 }
 
 function readFieldValue(input) {
     if (input.type === "checkbox") return input.checked;
     const raw = input.value.trim();
     if (raw === "") return null;
-    if (input.dataset.type === "integer") return parseInt(raw, 10);
-    if (input.dataset.type === "number") return parseFloat(raw);
+    const unitScale = input.dataset.unitScale ? Number(input.dataset.unitScale) : 1;
+    if (input.dataset.type === "integer") return parseInt(raw, 10) * unitScale;
+    if (input.dataset.type === "number") {
+        const v = parseFloat(raw);
+        return isFinite(v) ? v * unitScale : v;
+    }
     if (raw.includes(",") && input.dataset.field === "port") {
         return raw.split(",").map((item) => parseInt(item.trim(), 10)).filter((item) => !Number.isNaN(item));
     }
@@ -1950,14 +2291,49 @@ function renderSettings(schema, seed = {}) {
             sourceForm.appendChild(makeField("source", name, source.properties[name], sourceValues[name]));
         }
     }
+    snapshotFormBaseline();
+}
+
+function settingsInputs() {
+    // NOTE: this selector previously targeted "#settings-editor", an element
+    // that does not exist (the panel is #settings-panel) — so DAN's Apply
+    // collected NOTHING and sent an empty payload: the server acked
+    // "applied []" and the radio never tuned. ARIC's station chips bypass
+    // this path, which is why ARIC tuned and DAN didn't.
+    return document.querySelectorAll(
+        "#capture-settings-form input, #capture-settings-form select, " +
+        "#source-settings-form input, #source-settings-form select");
 }
 
 function collectSettings() {
     const payload = { capture: {}, source: {} };
-    document.querySelectorAll("#settings-editor input, #settings-editor select").forEach((input) => {
+    settingsInputs().forEach((input) => {
         payload[input.dataset.group][input.dataset.field] = readFieldValue(input);
     });
     return payload;
+}
+
+// Baseline of what the forms held after the last server seed — Apply only
+// sends fields the user actually CHANGED, so tuning the center can no longer
+// drag lo_shift / backend_sample_rate / source fields along with it.
+let formBaseline = { capture: {}, source: {} };
+
+function snapshotFormBaseline() {
+    formBaseline = { capture: {}, source: {} };
+    settingsInputs().forEach((input) => {
+        formBaseline[input.dataset.group][input.dataset.field] = readFieldValue(input);
+    });
+}
+
+function sameValue(a, b) {
+    if (a === null || a === undefined || b === null || b === undefined) {
+        return (a === null || a === undefined) && (b === null || b === undefined);
+    }
+    const x = Number(a), y = Number(b);
+    if (isFinite(x) && isFinite(y) && String(a).trim() !== "" && String(b).trim() !== "") {
+        return Math.abs(x - y) <= 1e-9 * Math.max(1, Math.abs(x), Math.abs(y));
+    }
+    return String(a) === String(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,8 +2352,28 @@ async function fetchConfig() {
     return resp.json();
 }
 
+// The ARIC station chips are gated by the ACTIVE device's tuning envelope —
+// a Pluto (325 MHz–3.8 GHz) greys out chips an AIR-T could tune.
+function gateStationChips(env) {
+    if (!env) return;
+    document.querySelectorAll(".freq-chip[data-mhz]").forEach((chip) => {
+        const hz = parseFloat(chip.dataset.mhz) * 1e6;
+        if (!isFinite(hz)) return;
+        const legal = hz >= env.freq_min && hz <= env.freq_max;
+        chip.disabled = !legal;
+        chip.classList.toggle("is-disabled", !legal);
+        if (!legal) {
+            chip.title = `Outside this device's ${(env.freq_min / 1e6).toFixed(0)}–` +
+                         `${(env.freq_max / 1e6).toFixed(0)} MHz tuning range`;
+        } else if (chip.title) {
+            chip.title = "";
+        }
+    });
+}
+
 function seedStaticControls(config) {
     if (config && config.device) updateDeviceLabel(config.device.label);
+    gateStationChips(config && config.envelope);
     const cap = (config && config.capture) || {};
     if (cap.nfft) {
         radioNfft = cap.nfft;   // /config re-sync — the other radioNfft updater
@@ -2021,11 +2417,29 @@ function seedCaptureForm(config) {
             if (name in cap) setFieldValue(input, cap[name]);
             const hint = hints && hints[name];
             if (hint && input.tagName === "INPUT" && input.type === "number") {
-                const [lo, hi, unit] = hint;
+                let [lo, hi, unit] = hint;
+                const units = FIELD_UNITS[name];
+                if (units) {
+                    if (lo != null) lo = lo / units.scale;
+                    if (hi != null) hi = hi / units.scale;
+                    unit = units.unit;
+                }
                 if (lo !== undefined && lo !== null) input.min = lo;
                 if (hi !== undefined && hi !== null) input.max = hi;
                 input.title = `device range: ${lo} – ${hi} ${unit}`;
             }
+        });
+    snapshotFormBaseline();
+}
+
+// Applied source-spec overrides (verified-reconnect path): seed the Source
+// form from what the server actually runs, like the capture form.
+function seedSourceForm(config) {
+    const source = (config && config.source) || {};
+    document.querySelectorAll("#source-settings-form input, #source-settings-form select")
+        .forEach((input) => {
+            const name = input.dataset.field;
+            if (name in source) setFieldValue(input, source[name]);
         });
 }
 
@@ -2037,7 +2451,8 @@ function scheduleConfigRefresh() {
         try {
             const config = await fetchConfig();
             seedStaticControls(config);
-            seedCaptureForm(config);
+            seedSourceForm(config);
+            seedCaptureForm(config);   // snapshots the form baseline last
             if (typeof seedAnalysisForm === "function") seedAnalysisForm(config);
         } catch (_) { /* transient — next ack retries */ }
     }, 250);
@@ -2051,7 +2466,7 @@ async function loadSchema(seed = null) {
     if (!effSeed) {
         try {
             const config = await fetchConfig();
-            effSeed = { captures: [config.capture || {}], source: {} };
+            effSeed = { captures: [config.capture || {}], source: config.source || {} };
             seedStaticControls(config);
             if (typeof seedAnalysisForm === "function") seedAnalysisForm(config);
         } catch (err) {
@@ -2065,16 +2480,31 @@ async function loadSchema(seed = null) {
 document.getElementById("settings-apply").addEventListener("click", () => {
     // Merge the hidden lower-level params from an uploaded sweep JSON under the
     // visible form values (form wins), so uploading a sweep actually seeds them
-    // instead of being silently dropped (LV-F6).
+    // instead of being silently dropped (LV-F6). Form fields the user did NOT
+    // change since the last server seed are dropped, so e.g. a center change
+    // can never re-submit lo_shift / backend_sample_rate / source fields as a
+    // side effect.
     const form = collectSettings();
+    for (const group of ["capture", "source"]) {
+        for (const key of Object.keys(form[group])) {
+            if (key in formBaseline[group] && sameValue(form[group][key], formBaseline[group][key])) {
+                delete form[group][key];
+            }
+        }
+    }
     const hiddenCapture = (hiddenSweepSettings.captures && hiddenSweepSettings.captures[0]) || {};
     const hiddenSource  = hiddenSweepSettings.source || {};
     const payload = {
         capture: { ...hiddenCapture, ...form.capture },
         source:  { ...hiddenSource,  ...form.source  },
     };
+    if (!Object.keys(payload.capture).length && !Object.keys(payload.source).length) {
+        logMsg("Apply: no fields changed — nothing sent");
+        return;
+    }
+    const sentKeys = [...Object.keys(payload.capture), ...Object.keys(payload.source)];
     sendControl(payload);
-    logMsg("Settings sent");
+    logMsg(`Settings sent (${sentKeys.join(", ")})`);
 });
 
 document.getElementById("settings-upload").addEventListener("change", async (e) => {

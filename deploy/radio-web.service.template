@@ -1,0 +1,37 @@
+# radio-web systemd unit — installed by setup.sh (placeholders are substituted).
+# The service reads all runtime configuration from /etc/radio-web/radio.env
+# (mode, port, credentials, session secret) — nothing secret lives in this file.
+[Unit]
+Description=NIST-Omran live radio viewer (@RADIO_MODE@ mode)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@REPO_ROOT@
+EnvironmentFile=/etc/radio-web/radio.env
+# Reset-Radio failure output survives the process being replaced (the web UI
+# and journal read it back after the restart).
+Environment=RADIO_RESET_LOG=/var/log/radio-web/reset.log
+LogsDirectory=radio-web
+ExecStart=@REPO_ROOT@/deploy/run_service.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGINT
+# Hardening. NOTE: do NOT add NoNewPrivileges=true — the Reset Radio button
+# relies on one narrowly-scoped passwordless sudo command (see
+# live/install_radio_web_sudoers.sh), which NoNewPrivileges would break.
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@REPO_ROOT@
+# The radio pipeline logs verified operations to stdout — journald keeps them:
+#   journalctl -u radio-web -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

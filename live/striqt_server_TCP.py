@@ -5,6 +5,18 @@ striqt-backed AIR8201 live server.
 Runs on the Deepwave AIR-T / AIR8201-B and streams spectrogram frames to a separate viewer (finalviewer.py) over TCP.
 """
 
+import sys as _sys
+for _line in (
+    "=" * 72,
+    "DEPRECATED: the TCP server/viewer pair is superseded by the web viewer",
+    "(striqt_web_server.py) over Ethernet/mDNS — same split-machine use case,",
+    "with auth, verified operations, and the full UI. This script is kept as",
+    "a frozen fallback and no longer receives fixes.",
+    "=" * 72,
+):
+    print(_line, file=_sys.stderr)
+del _sys, _line
+
 import json
 import math
 import os

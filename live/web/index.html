@@ -5,12 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
     <title>Live Spectrogram + PSD</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
+         Fonts fall back to the system stacks declared in style.css; uPlot is
+         vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
     <link rel="stylesheet" href="style.css">
-    <!-- uPlot: fast canvas charting for the PSD plot. CDN; can be vendored. -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+    <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
 
@@ -61,6 +60,7 @@
         <div class="rail-tab active" data-tab="display" role="tab">DISPLAY</div>
         <div class="rail-tab pro-only" data-tab="psd" role="tab">PSD</div>
         <div class="rail-tab pro-only" data-tab="capture" role="tab">CAPTURE</div>
+        <div class="rail-tab" data-tab="ops" role="tab">OPS</div>
     </div>
 
     <div class="rail-scroll">
@@ -166,6 +166,19 @@
             <div id="analysis-form" class="settings-grid"></div>
             <button id="analysis-apply" type="button">Apply analysis</button>
         </section>
+
+        <!-- ── OPS panel: verified operations + service health ──────────── -->
+        <section class="rail-panel" data-panel="ops">
+            <div id="ops-health">health: —</div>
+            <button id="ops-refresh" type="button" title="Reload operation history and service health (read-only)">Refresh</button>
+            <div id="ops-list"></div>
+            <!-- Raw service journal (journalctl -fu radio-web), admin only.
+                 Streams over /ws/logs — a log view, never a shell. -->
+            <div class="admin-only">
+                <h3 class="settings-h">Service journal</h3>
+                <pre id="ops-journal">(connecting…)</pre>
+            </div>
+        </section>
     </div>
 
     <!-- ── BAND MONITOR (black, multi-value) — filled by app.js ─────────── -->
@@ -200,6 +213,7 @@
     <section class="panel" id="psd-row">
         <div class="panel-head">
             <h2>Power spectral density</h2>
+            <span class="panel-hint">wheel: zoom · drag: pan · Shift-drag: zoom box · Alt-drag: band · double-click: reset</span>
             <div class="legend-key">
                 <span class="key"><i class="swatch swatch-mean"></i>Mean</span>
                 <span class="key"><i class="swatch swatch-max"></i>Max</span>
@@ -238,7 +252,13 @@
 
 <!-- ══ SCRIPTS ══════════════════════════════════════════════════════════════ -->
 <script src="colormap.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<script src="vendor/uPlot.min.js"></script>
+<script>
+// Vendored uPlot missing (fresh checkout without assets)? Fall back to the CDN.
+if (!window.uPlot) {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
+}
+</script>
 <script src="app.js"></script>
 
 <!-- Rail tab switching (layout only — plain divs, never sends control) -->
@@ -379,6 +399,7 @@
             var chip = document.createElement("button");
             chip.type = "button";
             chip.className = "freq-chip" + (tunable ? "" : " is-disabled");
+            chip.dataset.mhz = String(it.mhz);
             chip.innerHTML =
                 '<span class="fc-name"></span>' +
                 '<span class="fc-mhz"></span>';
@@ -391,8 +412,6 @@
                 chip.title = "Outside the radio's 300 MHz – 6 GHz tuning range";
             } else {
                 chip.addEventListener("click", function () {
-                    var input = document.getElementById("center-mhz");
-                    if (input) input.value = it.mhz.toFixed(3);
                     if (typeof sendControl === "function") {
                         sendControl({ center: it.mhz * 1e6 });
                     }

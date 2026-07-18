@@ -6,6 +6,17 @@ Merges the radio backend (airt_live_server_striqt.py) and
 the Qt viewer UI (finalviewer.py) into one process.
 """
 
+import sys as _sys
+for _line in (
+    "=" * 72,
+    "DEPRECATED: the PyQt standalone viewer is superseded by the kiosk",
+    "launcher (striqt_kiosk.py), which shows the full web UI locally.",
+    "Kept as a frozen fallback; not maintained.",
+    "=" * 72,
+):
+    print(_line, file=_sys.stderr)
+del _sys, _line
+
 import csv
 import os
 import sys

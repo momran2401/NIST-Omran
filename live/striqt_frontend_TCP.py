@@ -6,6 +6,16 @@ Pairs with airt_live_server_full.py to visualize incoming data.
 Start the server first, then run this:  python3 live_viewer_full.py <ip> [--port N]
 """
 
+import sys as _sys
+for _line in (
+    "=" * 72,
+    "DEPRECATED: the TCP viewer is superseded by opening the web viewer in a",
+    "browser (http://<radio>:8000). Kept as a frozen fallback; not maintained.",
+    "=" * 72,
+):
+    print(_line, file=_sys.stderr)
+del _sys, _line
+
 import sys
 import argparse
 import socket

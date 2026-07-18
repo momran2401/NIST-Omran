@@ -474,3 +474,60 @@ body.light-theme ::-webkit-scrollbar-thumb:hover { background: #aab6c7; }
     #dashboard { overflow: visible; }
     #waterfall-row { grid-template-columns: 1fr; }
 }
+
+/* ── OPS panel: verified operations + service health ─────────────────────── */
+#ops-health {
+    font: 11px/1.6 "IBM Plex Mono", Menlo, monospace;
+    color: var(--dim, #8aa0b3);
+    background: var(--bg2, #0e1726);
+    border: 1px solid var(--border, #22303f);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+}
+.oph { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+       margin-right: 5px; vertical-align: baseline; }
+.oph-ok   { background: #34d17b; }
+.oph-warn { background: #ffb74d; }
+.oph-status { text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+
+#ops-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.op-entry {
+    background: var(--bg2, #0e1726);
+    border: 1px solid var(--border, #22303f);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: 10.5px/1.5 "IBM Plex Mono", Menlo, monospace;
+}
+.op-head { display: flex; align-items: center; gap: 6px; }
+.op-id   { color: var(--accent, #4ea3ff); font-weight: 600; }
+.op-kind { color: var(--dim, #8aa0b3); text-transform: uppercase;
+           letter-spacing: 0.06em; font-size: 9.5px; }
+.op-state {
+    margin-left: auto; font-size: 9.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 1px 6px; border-radius: 8px;
+}
+.op-state.op-ok      { color: #34d17b; background: rgba(52,209,123,0.12); }
+.op-state.op-warn    { color: #ffb74d; background: rgba(255,183,77,0.12); }
+.op-state.op-bad     { color: #ff6060; background: rgba(255,96,96,0.12); }
+.op-state.op-running { color: var(--accent, #4ea3ff); background: var(--accent-soft, rgba(78,163,255,0.13)); }
+.op-summary { color: #cdd7e1; margin: 2px 0; }
+.op-stages  { border-left: 2px solid var(--border, #22303f); padding-left: 7px;
+              display: flex; flex-direction: column; gap: 1px; }
+.op-stage   { color: var(--dim, #8aa0b3); word-break: break-word; }
+.op-lvl-warn  { color: #ffb74d; }
+.op-lvl-error { color: #ff6060; }
+body.light-theme .op-summary { color: #26313c; }
+
+/* Service journal tail (OPS panel, admin only) */
+#ops-journal {
+    max-height: 260px; overflow: auto; margin-top: 4px;
+    padding: 7px 9px; border: 1px solid var(--border, #22303f);
+    border-radius: 6px; background: var(--bg2, #0e1726);
+    color: var(--dim, #8aa0b3);
+    font: 10px/1.5 "IBM Plex Mono", Menlo, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+.op-state.op-dim { color: var(--dim, #8aa0b3); background: rgba(138,160,179,0.12); }

@@ -4,6 +4,17 @@ PlutoSDR version of live spectrogram + PSD viewer -- single machine, no network.
 
 """
 
+import sys as _sys
+for _line in (
+    "=" * 72,
+    "DEPRECATED: use striqt_web_server.py --device pluto (or striqt_kiosk.py",
+    "--device pluto) — the Pluto now runs through the shared live/core",
+    "backend. Kept as a frozen fallback; not maintained.",
+    "=" * 72,
+):
+    print(_line, file=_sys.stderr)
+del _sys, _line
+
 import csv
 import os
 import sys
