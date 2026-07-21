@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "Use of this software is required to use the citation below."
+authors:
+- family-names: "Omran"
+  given-names: "Mustafa Ahmed"
+  orcid: "https://orcid.org/0009-0008-0565-7884"
+title: "Live RF Spectrogram User Interface for SDRs"
+version: 0.1.0
+date-released: 2026-08-07
+url: "https://github.com/momran2401/NIST-Omran"
