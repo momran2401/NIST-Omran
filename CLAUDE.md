@@ -24,7 +24,7 @@ frontend script — fix it once in `live/core/`.**
 - `core/parsing.py` — freedom-model parsers, `ANALYSIS_TARGETS`, striqt scratch validators
 - `core/config.py` — `RadioConfig` + `SharedConfig` (tier-1 clamp/snap, tier-2
   scratch probe, tier-3 compute backstop). `update()` returns the ack **plus
-  `op_id`**; `take_dirty()` returns `(dirty, cfg, op_id, reconnect)`
+  `op_id`**; `take_dirty()` returns `(dirty, cfg, op_id, reconnect, changed_fields)`
 - `core/dsp.py` — quicklook/calibrated/psd/ssb backends, `aligned_nfft` grid,
   `build_header` (frame-header contract)
 - `core/devices/` — adapter layer: `resolve_device(selector)` handles

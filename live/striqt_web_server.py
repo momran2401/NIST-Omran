@@ -29,6 +29,7 @@ import math
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from core.dsp import aligned_nfft
 from core.operations import OPERATIONS
 from core.recording import RecordingManager
 from core.serialization import serialize_frame
+from core.shims import seal_open_fds_for_exec
 from core.striqt_compat import _ANALYSIS_OK, _SENSOR_OK
 
 # FastAPI
@@ -697,7 +699,14 @@ async def logs_ws_endpoint(ws: WebSocket):
         except Exception:
             return
     proc = None
+    read_task = None
+    disconnect_task = None
     try:
+        # The deployed AIR-T runtime has been observed to ignore Popen's
+        # close_fds boundary for driver-created inheritable descriptors.  Seal
+        # everything already open before forking; CLOEXEC then makes the kernel
+        # enforce the boundary and prevents journalctl from owning XDMA.
+        seal_open_fds_for_exec()
         proc = await asyncio.create_subprocess_exec(
             journalctl, "-u", RADIO_SERVICE_NAME, "-n", "200", "-f",
             "--no-pager", "-o", "short-iso",
@@ -709,23 +718,36 @@ async def logs_ws_endpoint(ws: WebSocket):
             # causing the replacement stream to fail with EBUSY.
             close_fds=True,
         )
+        read_task = asyncio.create_task(proc.stdout.readline())
+        disconnect_task = asyncio.create_task(ws.receive())
         while True:
-            raw = await proc.stdout.readline()
+            done, _ = await asyncio.wait(
+                {read_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                break
+            raw = read_task.result()
             if not raw:
                 if proc.returncode is not None:
                     await ws.send_text(json.dumps(
                         {"journal": f"(journal tail ended, rc={proc.returncode})"}))
                     break
                 await asyncio.sleep(0.3)
+                read_task = asyncio.create_task(proc.stdout.readline())
                 continue
             await ws.send_text(json.dumps(
                 {"journal": raw.decode("utf-8", "replace").rstrip()}))
+            read_task = asyncio.create_task(proc.stdout.readline())
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception as exc:  # noqa: BLE001
         with contextlib.suppress(Exception):
             await ws.send_text(json.dumps({"journal": f"journal unavailable: {exc}"}))
     finally:
+        for task in (read_task, disconnect_task):
+            if task is not None and not task.done():
+                task.cancel()
         if proc is not None and proc.returncode is None:
             proc.terminate()
             with contextlib.suppress(Exception):
@@ -853,9 +875,10 @@ async def reset_radio(request: Request):
     pipes on /dev/null and answered 202 unconditionally, which proved only
     that Popen() worked. Now:
 
-      1. The command's stderr is captured, and the process is given ~1.2 s to
-         fail fast — a missing sudoers rule or unknown unit comes back as a
-         500 WITH the actual sudo/systemctl error text instead of silence.
+      1. A matching NOPASSWD sudoers rule uses ``systemctl restart``. When the
+         rule is absent but this process is verifiably inside the requested
+         systemd unit, it exits cleanly and lets ``Restart=always`` replace it.
+         Manually launched processes never take that fallback.
       2. The 202 response carries an operation id and THIS process's boot_id.
       3. The browser polls /health until it sees a DIFFERENT boot_id (proof
          the service really restarted and came back), or times out and says
@@ -869,10 +892,44 @@ async def reset_radio(request: Request):
     if role not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
 
+    op_id = OPERATIONS.begin("reset", f"restart service {RADIO_SERVICE_NAME}")
+
+    def _supervised_by_requested_unit():
+        """True only when this process is in the requested systemd cgroup."""
+        unit = RADIO_SERVICE_NAME
+        if not unit.endswith(".service"):
+            unit += ".service"
+        try:
+            cgroups = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return any(line.rsplit(":", 1)[-1].rstrip("/").endswith("/" + unit)
+                   for line in cgroups.splitlines())
+
+    def _supervised_self_restart(reason):
+        # Returning before SIGTERM lets the browser receive the old boot_id.
+        # The exact systemd cgroup check above plus Restart=always then provides
+        # the same supervised restart without requiring a host-specific sudoers
+        # rule.  A manually launched server is never killed by this fallback.
+        OPERATIONS.stage(
+            op_id, "validated",
+            f"systemd supervises this process; using self-restart fallback ({reason})")
+        OPERATIONS.stage(
+            op_id, "detached",
+            "SIGTERM scheduled; systemd will replace this process and the browser will verify boot_id")
+        asyncio.get_running_loop().call_later(
+            0.5, os.kill, os.getpid(), signal.SIGTERM)
+        return JSONResponse(
+            {"message": f"restarting {RADIO_SERVICE_NAME}…",
+             "op_id": op_id, "boot_id": health.BOOT_ID},
+            status_code=202,
+        )
+
     sudo_path = shutil.which("sudo")
     systemctl_path = shutil.which("systemctl")
-    op_id = OPERATIONS.begin("reset", f"restart service {RADIO_SERVICE_NAME}")
     if not sudo_path or not systemctl_path:
+        if _supervised_by_requested_unit():
+            return _supervised_self_restart("sudo/systemctl unavailable")
         OPERATIONS.finish(op_id, "failed", "sudo/systemctl not found on this host")
         return JSONResponse(
             {"error": "sudo/systemctl not found on this host", "op_id": op_id},
@@ -882,14 +939,13 @@ async def reset_radio(request: Request):
     OPERATIONS.stage(op_id, "applying",
                      f"{' '.join(cmd)} (requested by {request.client})")
 
-    # Preflight the exact sudoers permission WITHOUT executing the restart —
-    # the most common failure (missing/wrong sudoers rule) is caught here
-    # synchronously, with sudo's real error text, before anything is killed.
+    # Inspect sudo's complete rule listing. ``sudo -l <command>`` returning 0
+    # only means the command is permitted *with a password*; it does not prove
+    # that ``sudo -n`` can execute it. Require an explicit NOPASSWD entry.
     def _preflight():
         try:
             return subprocess.run(
-                [sudo_path, "-n", "-l", systemctl_path, "restart",
-                 RADIO_SERVICE_NAME],
+                [sudo_path, "-n", "-l"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=3,
             )
@@ -897,9 +953,17 @@ async def reset_radio(request: Request):
             return e
 
     pre = await asyncio.get_running_loop().run_in_executor(None, _preflight)
-    if isinstance(pre, Exception) or pre.returncode != 0:
+    desired = f"{systemctl_path} restart {RADIO_SERVICE_NAME}"
+    listing = "" if isinstance(pre, Exception) else (pre.stdout or "")
+    passwordless = any(
+        "NOPASSWD:" in line and desired in line
+        for line in listing.splitlines()
+    )
+    if isinstance(pre, Exception) or pre.returncode != 0 or not passwordless:
         reason = (str(pre) if isinstance(pre, Exception)
-                  else (pre.stdout or "").strip() or "sudoers preflight failed")
+                  else "no matching NOPASSWD sudoers rule")
+        if _supervised_by_requested_unit():
+            return _supervised_self_restart(reason)
         OPERATIONS.finish(op_id, "failed", f"sudo preflight: {reason}")
         return JSONResponse(
             {"error": f"not permitted: {reason} — run "
@@ -983,11 +1047,25 @@ async def _broadcaster():
     notices and structured operation events. Dropped connections are pruned.
     """
     interval   = 1.0 / max(state.BROADCAST_FPS, 1)
+    loop       = asyncio.get_running_loop()
+    next_tick  = loop.time()
     last_t     = 0.0
     last_diag  = 0.0   # throttle the heartbeat log to ~once/sec
 
     while True:
-        await asyncio.sleep(interval)
+        # Pace against an absolute deadline.  Sleeping ``interval`` after all
+        # serialization/send work made that work part of the frame period and
+        # consistently turned a requested 15 FPS into roughly 13–14 FPS.
+        next_tick += interval
+        delay = next_tick - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        else:
+            # Do not spin trying to repay a large scheduling stall.  Resume
+            # from the current clock while retaining normal one-frame jitter.
+            if delay < -interval:
+                next_tick = loop.time()
+            await asyncio.sleep(0)
 
         if not _connections:
             # Drain event queues even with no viewers so they don't go stale.

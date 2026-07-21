@@ -56,20 +56,23 @@ def test_ack_carries_op_id_and_no_op_for_noop(shared):
 
 def test_take_dirty_returns_pending_op(shared):
     ack = shared.update({"center": 2100e6})
-    dirty, cfg, op_id, reconnect = shared.take_dirty()
+    dirty, cfg, op_id, reconnect, changed = shared.take_dirty()
     assert dirty and cfg.center == 2100e6 and op_id == ack["op_id"]
     assert not reconnect
+    assert changed == {"center"}
     # Consumed: second take is clean.
-    dirty2, _, op_id2, _ = shared.take_dirty()
+    dirty2, _, op_id2, _, changed2 = shared.take_dirty()
     assert not dirty2 and op_id2 is None
+    assert changed2 == set()
 
 
 def test_source_overrides_apply_via_reconnect(shared):
     ack = shared.update({"source": {"calibration": "cal.json"}})
     assert "source.calibration" in ack["applied"]
     assert "calibration" in ack["reconnect"]
-    dirty, cfg, _, reconnect = shared.take_dirty()
+    dirty, cfg, _, reconnect, changed = shared.take_dirty()
     assert dirty and reconnect
+    assert changed == {"source.calibration"}
     assert cfg.source_config == {"calibration": "cal.json"}
     # Explicit null CLEARS the override back to the adapter default.
     ack2 = shared.update({"source": {"calibration": None}})
@@ -131,6 +134,7 @@ def test_restore_config_rolls_back_failed_hardware_recipe(shared):
     restored = shared.restore_config(good, reason="driver rejected arm")
     assert restored.sample_rate == good.sample_rate
     assert restored.gain == good.gain
-    dirty, current, op_id, reconnect = shared.take_dirty()
+    dirty, current, op_id, reconnect, changed = shared.take_dirty()
     assert not dirty and op_id is None and not reconnect
+    assert changed == set()
     assert current.sample_rate == good.sample_rate

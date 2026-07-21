@@ -43,11 +43,16 @@ class RecordingManager:
 
     def defaults(self):
         cfg = self.shared.snapshot()
+        # Rolling live view intentionally uses duration=0 (12-row chunks), but
+        # the recorder still needs a finite acquisition.  Twenty milliseconds
+        # keeps a two-channel AIR-T read below its DMA buffering limit; the old
+        # 100 ms fallback could overflow mid-capture at 15.36 MS/s.
+        capture_duration = float(cfg.duration) if float(cfg.duration) > 0 else 0.02
         return {
             "center_frequency": float(cfg.center),
             "sample_rate": float(cfg.sample_rate),
             "gain": float(cfg.gain),
-            "capture_duration": max(float(cfg.duration), 0.1),
+            "capture_duration": max(capture_duration, 0.001),
             "directory": str(DEFAULT_RECORDINGS_DIR),
             "include_raw_iq": False,
         }
@@ -73,7 +78,8 @@ class RecordingManager:
             self._thread_stop = threading.Event()
             self._status = {"state": "starting", "op_id": op_id,
                             "output": str(output), "started_at": time.time(),
-                            "duration": duration, "captures": 0, "elapsed_s": 0.0}
+                            "duration": duration, "captures": 0, "elapsed_s": 0.0,
+                            "phase": "releasing the live radio"}
             self._task = asyncio.create_task(
                 self._run(request, output, duration, op_id), name="radio-recording")
             return self.status()
@@ -102,7 +108,10 @@ class RecordingManager:
         gain = float(request.get("gain", cfg.gain))
         raw = "\n  iq_waveform: {}" if request.get("include_raw_iq") else ""
         freq_res = sample_rate / max(aligned_nfft(int(cfg.nfft)), 1)
-        capture_duration = max(float(request.get("capture_duration") or cfg.duration or 0.1), 0.001)
+        capture_duration = max(
+            float(request.get("capture_duration") or cfg.duration or 0.02),
+            0.001,
+        )
         ports = ", ".join(str(p) for p in state.CHANNELS)
         backend = "numpy" if self.demo else "cupy"
         binding = "noise" if self.demo else (state.DEVICE if state.DEVICE.startswith("air") else "air8201b")
@@ -151,11 +160,13 @@ sink:
             released = await asyncio.to_thread(self.acquirer.pause_and_release, 15.0)
             if not released:
                 raise RuntimeError("live acquirer did not release the radio within 15 seconds")
+            self._status["phase"] = "waiting for the radio handle to settle"
             OPERATIONS.stage(op_id, "released", "live radio released; allowing hardware handles to settle")
             if not self.demo:
                 await asyncio.sleep(float(os.environ.get("RADIO_RECORDING_SETTLE_SEC", "2.0")))
             OPERATIONS.stage(op_id, "applied", "sweep runner starting")
             self._status["state"] = "recording"
+            self._status["phase"] = "warming up capture → analysis → archive pipeline"
             advanced = str(request.get("yaml") or "").strip()
             spec_text = advanced or self._default_spec(request, output)
             fd, spec_name = tempfile.mkstemp(prefix="radio-record-", suffix=".yaml")
@@ -196,9 +207,15 @@ sink:
         from sweep_runner import run_sweep
 
         def progress(kind, **event):
-            if kind == "progress":
+            if kind == "opened":
+                self._status["phase"] = "acquiring/analyzing the first capture"
+            elif kind == "progress":
                 self._status.update(captures=event["captures"],
                                     elapsed_s=event["elapsed_s"])
+                self._status["phase"] = (
+                    "writing captures" if event["captures"]
+                    else "first capture is still in the analysis/write pipeline"
+                )
                 OPERATIONS.stage(
                     op_id, "progress",
                     f'{event["captures"]} captures · {event["elapsed_s"]:.1f} s')
@@ -210,6 +227,7 @@ sink:
 
     async def _run_demo(self, output, duration, op_id, spec_text):
         started = time.monotonic()
+        self._status["phase"] = "writing demo captures"
         while not self._stop.is_set() and (duration is None or time.monotonic() - started < duration):
             await asyncio.sleep(min(0.25, duration or 0.25))
             self._status["captures"] += 1

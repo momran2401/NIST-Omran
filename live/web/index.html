@@ -8,7 +8,7 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css?v=20260721-6">
+    <link rel="stylesheet" href="style.css?v=20260721-8">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
@@ -75,8 +75,8 @@
 
             <label class="ctrl-row">Mode
                 <select id="mode-sel">
-                    <option value="replace" selected>Boring 🥱</option>
-                    <option value="scroll">Cool 😎</option>
+                    <option value="replace" title="Full-window snapshots; large time windows can reduce frame rate">Boring 🥱</option>
+                    <option value="scroll" selected title="Rolling client-side history; keeps the live stream responsive">Cool 😎</option>
                 </select>
             </label>
 
@@ -133,7 +133,7 @@
             <label class="record-field">Recordings directory
                 <input id="record-directory" type="text">
             </label>
-            <label class="record-check"><input id="record-raw-iq" type="checkbox"> Include raw IQ (large)</label>
+            <label class="record-check"><span>Include raw IQ (large)</span><input id="record-raw-iq" type="checkbox"></label>
             <details class="record-advanced">
                 <summary>Advanced raw YAML (multi-frequency sweeps)</summary>
                 <p>Leave blank to use the current live view. A full sweep YAML here replaces the generated spec.</p>
@@ -286,7 +286,7 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js?v=20260721-6"></script>
+<script src="app.js?v=20260721-11"></script>
 
 <!-- Rail tab switching (layout only — plain divs, never sends control) -->
 <script>

@@ -23,7 +23,7 @@
 
 let ws          = null;
 let paused      = false;
-let replaceMode = true;     // Boring Mode (replace) vs Cool Mode (scroll)
+let replaceMode = false;    // Boring Mode (full-window snapshots) vs Cool Mode (fast scroll)
 let absRF       = true;     // absolute RF freq vs baseband offset
 let autoColor   = true;
 let showDiff    = false;    // RX1−RX2 difference on PSD
@@ -34,7 +34,8 @@ let psdYspan    = null;     // null = auto; number = fixed dB span
 let windowMs    = 20;
 let analysisMode = "spectrogram";
 let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
-let lastRender  = 0;        // performance.now() of the last rendered frame
+let nextRender  = 0;        // absolute render deadline (performance.now ms)
+let lastPsdRender = 0;      // standard rolling PSD is intentionally ~5 Hz
 
 // Role-based access. The server sends {"role": "admin"|"viewer"|"interns"} as
 // the first WS text frame. null = not yet known (pre-connect); non-admin roles
@@ -708,10 +709,14 @@ function updateRecordingUI(rec) {
     const banner = document.getElementById("recording-banner");
     if (banner) {
         banner.hidden = !active;
-        if (active) banner.textContent = `Recording in progress · ${rec.captures || 0} captures · ${(rec.elapsed_s || 0).toFixed(1)} s — live display resumes automatically`;
+        if (active) {
+            const count = rec.captures || 0;
+            const phase = rec.phase || (count ? "writing captures" : "preparing first capture");
+            banner.textContent = `Recording in progress · ${phase} · ${count} completed captures · ${(rec.elapsed_s || 0).toFixed(1)} s — live display resumes automatically`;
+        }
     }
     const status = document.getElementById("record-status");
-    if (status) status.textContent = `${rec.state || "idle"}${rec.output ? "\n" + rec.output : ""}${rec.error ? "\n" + rec.error : ""}`;
+    if (status) status.textContent = `${rec.state || "idle"}${rec.phase ? " · " + rec.phase : ""}${rec.captures !== undefined ? "\n" + rec.captures + " completed capture(s)" : ""}${rec.output ? "\n" + rec.output : ""}${rec.error ? "\n" + rec.error : ""}`;
     const start = document.getElementById("record-start");
     const stop = document.getElementById("record-stop");
     if (start) start.disabled = active;
@@ -796,12 +801,18 @@ function onFrame(data) {
     const hdrText = new TextDecoder().decode(new Uint8Array(data, 4, hdrLen));
     const header  = JSON.parse(hdrText);
 
-    // Throttle to Max fps: skip the block parse + render for frames arriving faster
-    // than 1000/maxFps. The header is already parsed; meta fps reflects the actual
-    // render rate since the fps counter runs only on rendered frames (LV-U1a).
+    // Absolute-deadline throttle. Comparing only against the previous actual
+    // render caused normal ±1–2 ms WebSocket jitter at a 15 FPS cap to skip a
+    // frame, then render the next one 133 ms later (the UI reported ~11 FPS
+    // while the wire delivered exactly 15). A small jitter allowance preserves
+    // every at-cap frame while still enforcing lower 10/5/2/1 FPS selections.
     const nowRender = performance.now();
-    if (nowRender - lastRender < 1000 / maxFps) return;
-    lastRender = nowRender;
+    const renderInterval = 1000 / maxFps;
+    if (!nextRender) nextRender = nowRender;
+    if (nowRender < nextRender - 2) return;
+    nextRender = nowRender - nextRender > renderInterval
+        ? nowRender + renderInterval
+        : nextRender + renderInterval;
 
     const { nfft, rows, channels, center, fs, gain, dtype, scale, backend,
             backend_requested, freqs_hz_f0, freqs_hz_step, fft_nfft, bin_avg,
@@ -887,7 +898,14 @@ function onFrame(data) {
         for (const ch of channels) {
             updateWaterfall(ch, blocks[ch], rows, nfft, center, fs);
         }
-        updatePSD(channels, blocks, rows, nfft);
+        // A rolling-window PSD scans roughly 1.1 million values for the
+        // two-channel 20 ms view. Updating that trace at the 15 FPS waterfall
+        // rate needlessly starved canvas rendering; 5 Hz is responsive for a
+        // summary trace and leaves every waterfall frame visible.
+        if (nowRender - lastPsdRender >= 200) {
+            updatePSD(channels, blocks, rows, nfft);
+            lastPsdRender = nowRender;
+        }
     }
     updateBandMonitor(channels, blocks, rows, nfft);
     updateMeta();
@@ -984,6 +1002,7 @@ function computeDisplayDepth(rows, nfft, fs) {
 function updateWaterfall(ch, block, rows, nfft, center, fs) {
     const depth = computeDisplayDepth(rows, nfft, fs);
     const size  = depth * nfft;
+    let reallocated = false;
 
     // Reallocate if dimensions changed
     if (!wfBuf[ch] || wfBuf[ch].length !== size) {
@@ -991,6 +1010,7 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         wfImageData[ch]     = new ImageData(nfft, depth);
         wfCanvas[ch].width  = nfft;
         wfCanvas[ch].height = depth;
+        reallocated = true;
     }
 
     const buf  = wfBuf[ch];
@@ -1025,12 +1045,19 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
     }
 
     // ── Render buffer → ImageData via viridis LUT ─────────────────────────
+    // In rolling mode only the incoming rows need color conversion. Shift the
+    // existing canvas in its native bitmap, then upload the small dirty strip.
+    // The old full-buffer conversion touched >1 million pixels per frame and
+    // limited Chromium to ~11 FPS even though the wire delivered exactly 15.
     const imgData  = wfImageData[ch].data;
     const LUT      = window.VIRIDIS_LUT;
     const [vmin, vmax] = levels;
     const rng      = vmax - vmin || 1;
 
-    for (let i = 0; i < size; i++) {
+    const fullRender = replaceMode || reallocated;
+    const newRows = fullRender ? depth : Math.min(bLen / nfft, depth);
+    const renderSize = newRows * nfft;
+    for (let i = 0; i < renderSize; i++) {
         const t  = Math.max(0, Math.min(1, (buf[i] - vmin) / rng));
         const li = Math.round(t * 255) * 4;
         imgData[i * 4]     = LUT[li];
@@ -1038,7 +1065,17 @@ function updateWaterfall(ch, block, rows, nfft, center, fs) {
         imgData[i * 4 + 2] = LUT[li + 2];
         imgData[i * 4 + 3] = 255;
     }
-    wfCtx[ch].putImageData(wfImageData[ch], 0, 0);
+    if (fullRender) {
+        wfCtx[ch].putImageData(wfImageData[ch], 0, 0);
+    } else if (newRows > 0) {
+        const keepRows = depth - newRows;
+        if (keepRows > 0) {
+            wfCtx[ch].drawImage(
+                wfCanvas[ch], 0, 0, nfft, keepRows,
+                0, newRows, nfft, keepRows);
+        }
+        wfCtx[ch].putImageData(wfImageData[ch], 0, 0, 0, 0, nfft, newRows);
+    }
 }
 
 // Populate the waterfall frequency-axis overlays (LV-F7). Five evenly spaced
@@ -1084,11 +1121,51 @@ function psdYLabel() {
         : "Integrated power (dB rel. FS)";
 }
 
+function psdPlotDimensions() {
+    const container = document.getElementById("psd-container");
+    const style = getComputedStyle(container);
+    const innerWidth = container.clientWidth
+        - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0);
+    const innerHeight = container.clientHeight
+        - parseFloat(style.paddingTop || 0) - parseFloat(style.paddingBottom || 0);
+    const legend = container.querySelector(".u-legend");
+    const legendHeight = legend ? legend.getBoundingClientRect().height : 28;
+    return {
+        width: Math.max(240, Math.floor(innerWidth || 900)),
+        height: Math.max(140, Math.floor((innerHeight || 300) - legendHeight)),
+    };
+}
+
+let psdResizeQueued = false;
+function fitUplotToContainer() {
+    if (!uplot || psdResizeQueued) return;
+    psdResizeQueued = true;
+    requestAnimationFrame(() => {
+        psdResizeQueued = false;
+        if (!uplot) return;
+        // uPlot temporarily clears axis ranges while setData() rebuilds scales.
+        // A ResizeObserver callback in that window makes setSize() draw axes
+        // whose internal tick state is still null ("object null is not
+        // iterable").  The next frame/resize will fit it once both scales are
+        // ready; the constructor already received the correct initial size.
+        if (uplot.scales.x.min == null || uplot.scales.y.min == null) return;
+        const size = psdPlotDimensions();
+        if (uplot.width !== size.width || uplot.height !== size.height) {
+            uplot.setSize(size);
+        }
+    });
+}
+
 function initUplot(freqs) {
     const container = document.getElementById("psd-plot");
+    if (uplot) {
+        const previous = uplot;
+        uplot = null;
+        previous.destroy();
+    }
     container.innerHTML = "";  // clear previous instance
 
-    const w = document.getElementById("psd-container").clientWidth || 900;
+    const size = psdPlotDimensions();
 
     // Series set follows the channel list (P3-4). Order for two channels is
     // the historical layout exactly: mean/max per channel, then holds, then
@@ -1115,8 +1192,8 @@ function initUplot(freqs) {
     }
 
     const opts = {
-        width:  w,
-        height: 300,
+        width:  size.width,
+        height: size.height,
         title:  `Power Spectral Density (${chans.map((c, i) => rxName(i)).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -1163,6 +1240,7 @@ function initUplot(freqs) {
 
     // Set up band dragging on the uPlot canvas
     setupBandDrag();
+    fitUplotToContainer();
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,8 +1291,13 @@ function statColors(stats) {
 
 function initUplotPsdStats(freqs, stats) {
     const container = document.getElementById("psd-plot");
+    if (uplot) {
+        const previous = uplot;
+        uplot = null;
+        previous.destroy();
+    }
     container.innerHTML = "";
-    const w = document.getElementById("psd-container").clientWidth || 900;
+    const size = psdPlotDimensions();
     const cols = stats ? statColors(stats) : [];
     const chans = channelList || [0, 1];
 
@@ -1231,8 +1314,8 @@ function initUplotPsdStats(freqs, stats) {
     });
 
     const opts = {
-        width:  w,
-        height: 300,
+        width:  size.width,
+        height: size.height,
         title:  `Power Spectral Density — striqt statistics (${chans.map((_, i) => `RX${i + 1}`).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -1267,6 +1350,7 @@ function initUplotPsdStats(freqs, stats) {
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
     setupBandDrag();
+    fitUplotToContainer();
 }
 
 function renderServerPsd(channels, blocks, rows, nfft) {
@@ -1812,17 +1896,6 @@ function exportPng() {
 }
 
 // ---------------------------------------------------------------------------
-// Resize handling
-// ---------------------------------------------------------------------------
-
-const resizeObserver = new ResizeObserver(() => {
-    if (!uplot || !freqsMHz) return;
-    const w = document.getElementById("psd-container").clientWidth;
-    uplot.setSize({ width: w, height: 300 });
-});
-resizeObserver.observe(document.getElementById("psd-container"));
-
-// ---------------------------------------------------------------------------
 // Control wiring
 // ---------------------------------------------------------------------------
 
@@ -1913,6 +1986,7 @@ durCustom.addEventListener("input", applyDuration);
 
 document.getElementById("fps-sel").addEventListener("change", (e) => {
     maxFps = parseFloat(e.target.value) || 15;   // client-side render cap (LV-U1a)
+    nextRender = 0;                              // restart the absolute schedule
 });
 
 document.getElementById("auto-color").addEventListener("change", (e) => {
@@ -2639,6 +2713,12 @@ ensureChannels([0, 1]);
 // Init PSD with placeholder data so layout is in place
 freqsMHz = buildFreqsMHz(curCenter, curFs, curBins, absRF, curF0, curStep);
 initUplot(freqsMHz);
+const psdContainer = document.getElementById("psd-container");
+if (typeof ResizeObserver !== "undefined" && psdContainer) {
+    new ResizeObserver(fitUplotToContainer).observe(psdContainer);
+} else {
+    window.addEventListener("resize", fitUplotToContainer);
+}
 updateSsbOption();
 installReadOnlyGuard();
 

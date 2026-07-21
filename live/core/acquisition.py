@@ -21,7 +21,7 @@ from .dsp import build_header, compute_blocks, samples_needed
 from .operations import OPERATIONS, verdict_state
 from .shims import (
     _close_rx_stream, close_source, enable_stream, get_stream_mtu, get_stream_ports,
-    open_stream, query_device_envelope, stream_buffers_for,
+    get_rx_stream, open_stream, query_device_envelope, stream_buffers_for,
 )
 from .striqt_compat import ReceiveStreamError, specs
 
@@ -270,6 +270,11 @@ class Acquirer(threading.Thread):
     def _arm_verification(self, op_id, vstate):
         """Hand the op to the Computer: it finishes when the first frame of
         the current ring generation is actually computed (data-path proof)."""
+        # Recovery/resume rearms don't own an operation.  They must never
+        # replace a real user operation that is still awaiting its fresh-frame
+        # proof (the old behavior marked every such operation superseded).
+        if op_id is None:
+            return
         with self._lock:
             gen = self._gen
         with self._verify_lock:
@@ -342,28 +347,37 @@ class Acquirer(threading.Thread):
             f"rearm: center {cfg.center/1e6:.6g} MHz, "
             f"{cfg.sample_rate/1e6:.6g} MS/s, gain {cfg.gain:.1f} dB, "
             f"nfft={cfg.nfft}, rows={cfg.rows}")
-        # SoapyAIRT exposes one RX DMA stream. Opening a replacement while the
-        # previous stream owns /dev/xdma0_c2h_0 fails with EBUSY. Release only
-        # the RX stream; source.close() would tear down the process-lifetime
-        # AIR-T device and its management sensors.
+        # Apply the capture recipe to the existing stream.  striqt's Soapy
+        # backend disables the stream, programs gain/frequency/rate, and then
+        # this method re-enables it.  Closing and immediately recreating the
+        # DMA stream here used to leave AIR-T's /dev/xdma0_c2h_0 handle busy;
+        # every setting change then blocked for ~6.5 s and entered recovery.
+        # The same in-place arm path is portable to Pluto/generic Soapy.
         enable_stream(self.source, False)
-        _close_rx_stream(self.source)
-        # The XDMA character device can remain busy briefly after close.
-        # Retry only this RX stream on the same initialized source.
-        open_error = None
-        for attempt in range(6):
+        rx = get_rx_stream(self.source)
+        # Recording deliberately closes the live stream before handing the
+        # source to the sweep runner.  If it is still closed on resume, reopen
+        # exactly once; ordinary settings changes never enter this branch.
+        if rx is not None and getattr(rx, "stream", None) is None:
+            open_stream(self.source)
+        self.source.arm_spec(make_capture(cfg))
+        # AIR-T's activation opens an exclusive XDMA channel.  A rapid
+        # deactivate/reconfigure/activate can transiently return EBUSY while
+        # the kernel releases the prior activation.  Retry activation on the
+        # same stream (never rebuild the device); other radios get one attempt.
+        attempts = 6 if state.DEVICE in ("air7101b", "air7201b", "air8201b") else 1
+        activate_error = None
+        for attempt in range(attempts):
             try:
-                open_stream(self.source)
-                open_error = None
+                enable_stream(self.source, True)
+                activate_error = None
                 break
             except Exception as exc:
-                open_error = exc
-                _close_rx_stream(self.source)
-                time.sleep(0.05 * (attempt + 1))
-        if open_error is not None:
-            raise open_error
-        self.source.arm_spec(make_capture(cfg))
-        enable_stream(self.source, True)
+                activate_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.05 * (attempt + 1))
+        if activate_error is not None:
+            raise activate_error
         # Drop stale samples from the old tuning so they never mix into a frame.
         with self._lock:
             self._clear_ring_locked()
@@ -460,7 +474,7 @@ class Acquirer(threading.Thread):
                             print(f"[radio] resume open failed: {exc}; retry in 1s")
                             time.sleep(1.0)
                     continue
-                dirty, new_cfg, op_id, reconnect = self.shared.take_dirty()
+                dirty, new_cfg, op_id, reconnect, changed_fields = self.shared.take_dirty()
                 if dirty:
                     cfg = new_cfg
                     try:
@@ -477,9 +491,33 @@ class Acquirer(threading.Thread):
                             with self._lock:
                                 self._clear_ring_locked()
                             self.open_radio(cfg, op_id)
-                        else:
+                        elif changed_fields & (
+                            self._FREQ_FIELDS | self._RATE_FIELDS |
+                            self._GAIN_FIELDS |
+                            {"analysis_bandwidth", "host_resample",
+                             "backend_sample_rate"}
+                        ):
                             self.rearm(cfg, op_id)
-                        read_size, tmp, buffers = self._make_read_buffers()
+                        else:
+                            # FFT/rows/backend/analysis/LO-display changes only
+                            # affect the compute path.  Invalidate any in-flight
+                            # old-config frame, but leave the SDR stream alone.
+                            OPERATIONS.stage(
+                                op_id, "applying",
+                                "compute/display settings changed — radio stream kept open")
+                            with self._lock:
+                                self._clear_ring_locked()
+                            OPERATIONS.stage(
+                                op_id, "readback",
+                                "not applicable — no hardware-facing field changed")
+                            self._arm_verification(op_id, "success")
+                        if reconnect or changed_fields & (
+                            self._FREQ_FIELDS | self._RATE_FIELDS |
+                            self._GAIN_FIELDS |
+                            {"analysis_bandwidth", "host_resample",
+                             "backend_sample_rate"}
+                        ):
+                            read_size, tmp, buffers = self._make_read_buffers()
                         self._last_good_source = dict(cfg.source_config or {})
                         last_good_cfg = cfg.snapshot()
                     except Exception as e:
@@ -694,7 +732,7 @@ class DemoAcquirer(threading.Thread):
             # This is the compute thread in demo mode — serve tier-2 probes here
             # for the same thread-bound-cache reason as the Computer (P2a-5).
             self.shared.service_probe()
-            dirty, cfg, op_id, _reconnect = self.shared.take_dirty()
+            dirty, cfg, op_id, _reconnect, _changed = self.shared.take_dirty()
             if dirty and op_id is not None:
                 if pending_op is not None:
                     OPERATIONS.finish(pending_op, "superseded",

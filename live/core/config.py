@@ -187,6 +187,11 @@ class SharedConfig:
         # Source-spec changes can only apply by closing + reopening the
         # device; take_dirty hands this flag to the Acquirer.
         self._reconnect = False
+        # Exact fields awaiting application.  The hardware thread uses this to
+        # distinguish radio-facing changes from compute/display-only changes;
+        # rebuilding an SDR DMA stream for rows, FFT, or PSD toggles is both
+        # unnecessary and unsafe on drivers that retain an exclusive handle.
+        self._changed_fields = set()
 
     def snapshot(self):
         with self._lock:
@@ -1003,6 +1008,7 @@ class SharedConfig:
                     self._cfg.rows = max_rows
                     changes.append(("rows", old_rows, max_rows))
                 self._dirty = True
+                self._changed_fields.update(k for k, _, _ in changes)
                 if reconnect:
                     self._reconnect = True
         # Operation record (outside the lock — logging does I/O). Every net
@@ -1059,16 +1065,21 @@ class SharedConfig:
         }
 
     def take_dirty(self):
-        """Returns (dirty, cfg_snapshot, op_id, reconnect) — op_id is the
+        """Returns (dirty, cfg_snapshot, op_id, reconnect, changed_fields).
+
+        ``op_id`` is the
         pending operation awaiting hardware apply/verification (or None);
         reconnect means source-spec overrides changed and the device must be
-        closed and reopened rather than rearmed."""
+        closed and reopened rather than rearmed. ``changed_fields`` lets the
+        acquisition loop avoid touching the radio for compute-only changes.
+        """
         with self._lock:
             dirty = self._dirty
             self._dirty = False
             op_id, self._pending_op = self._pending_op, None
             reconnect, self._reconnect = self._reconnect, False
-            return dirty, self._cfg.snapshot(), op_id, reconnect
+            changed, self._changed_fields = set(self._changed_fields), set()
+            return dirty, self._cfg.snapshot(), op_id, reconnect, changed
 
     def restore_source(self, source_config, reason=""):
         """Backstop for a failed reconnect: revert the source overrides to the
@@ -1090,6 +1101,7 @@ class SharedConfig:
             self._cfg = config.snapshot()
             self._dirty = False
             self._reconnect = False
+            self._changed_fields.clear()
             self._pending_op = None
             snap = self._cfg.snapshot()
         self.push_notice(

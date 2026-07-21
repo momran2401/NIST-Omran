@@ -13,7 +13,7 @@ class FakeSource:
         self.calls.append("arm")
 
 
-def test_rearm_releases_existing_rx_stream_before_open(monkeypatch):
+def test_rearm_keeps_existing_rx_stream_open(monkeypatch):
     state.configure_device("air8201b")
     acquirer = Acquirer(SharedConfig())
     calls = []
@@ -27,7 +27,25 @@ def test_rearm_releases_existing_rx_stream_before_open(monkeypatch):
 
     acquirer.rearm(acquirer.shared.snapshot(), op_id=123)
 
-    assert calls == ["disable", "close-rx", "open-rx", "arm", "enable"]
+    assert calls == ["disable", "arm", "enable"]
+
+
+def test_rearm_reopens_a_deliberately_closed_stream(monkeypatch):
+    state.configure_device("air8201b")
+    acquirer = Acquirer(SharedConfig())
+    calls = []
+    source = FakeSource(calls)
+    source._rx_stream = type("Rx", (), {"stream": None})()
+    acquirer.source = source
+
+    monkeypatch.setattr(acquisition, "enable_stream", lambda _s, on: calls.append("enable" if on else "disable"))
+    monkeypatch.setattr(acquisition, "open_stream", lambda _s: calls.append("open-rx"))
+    monkeypatch.setattr(acquirer, "_readback_and_verify", lambda _cfg, _op: "success")
+    monkeypatch.setattr(acquirer, "_arm_verification", lambda _op, _state: None)
+
+    acquirer.rearm(acquirer.shared.snapshot(), op_id=123)
+
+    assert calls == ["disable", "open-rx", "arm", "enable"]
 
 
 def test_air_t_recovery_never_closes_process_lifetime_source(monkeypatch):
@@ -46,3 +64,26 @@ def test_air_t_recovery_never_closes_process_lifetime_source(monkeypatch):
 
     assert calls == ["rearm"]
     assert acquirer.source is source
+
+
+def test_rearm_retries_transient_air_t_activation(monkeypatch):
+    state.configure_device("air8201b")
+    acquirer = Acquirer(SharedConfig())
+    calls = []
+    acquirer.source = FakeSource(calls)
+    failures = iter([OSError("EBUSY"), OSError("EBUSY"), None])
+
+    def enable(_source, on):
+        calls.append("enable" if on else "disable")
+        outcome = next(failures) if on else None
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(acquisition, "enable_stream", enable)
+    monkeypatch.setattr(acquisition.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(acquirer, "_readback_and_verify", lambda _cfg, _op: "success")
+    monkeypatch.setattr(acquirer, "_arm_verification", lambda _op, _state: None)
+
+    acquirer.rearm(acquirer.shared.snapshot(), op_id=123)
+
+    assert calls == ["disable", "arm", "enable", "enable", "enable"]

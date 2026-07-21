@@ -46,3 +46,36 @@ def test_demo_run_until_stop(tmp_path):
         assert not acquirer.paused
 
     asyncio.run(scenario())
+
+
+def test_rolling_view_uses_dma_safe_recording_capture_duration(tmp_path):
+    async def scenario():
+        shared = SharedConfig()  # rolling mode: duration == 0
+        manager = RecordingManager(FakeAcquirer(), shared, demo=False)
+
+        assert manager.defaults()["capture_duration"] == 0.02
+        spec = manager._default_spec(
+            {"directory": str(tmp_path)}, tmp_path / "capture.zarr.zip")
+        assert "    duration: 0.02\n" in spec
+
+    asyncio.run(scenario())
+
+
+def test_record_spec_uses_form_radio_fields_and_raw_iq(tmp_path):
+    async def scenario():
+        manager = RecordingManager(FakeAcquirer(), SharedConfig(), demo=False)
+        spec = manager._default_spec({
+            "center_frequency": 2.1e9,
+            "sample_rate": 7.68e6,
+            "gain": -3.5,
+            "capture_duration": 0.01,
+            "include_raw_iq": True,
+        }, tmp_path / "capture.zarr.zip")
+
+        assert "center_frequency: 2100000000.0" in spec
+        assert "sample_rate: 7680000.0" in spec
+        assert "gain: -3.5" in spec
+        assert "duration: 0.01" in spec
+        assert "iq_waveform: {}" in spec
+
+    asyncio.run(scenario())

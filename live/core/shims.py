@@ -6,6 +6,8 @@ verbatim from striqt_web_server.py.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from . import state
@@ -15,6 +17,32 @@ from . import state
 # (match the getattr pattern used in striqt_server_TCP.py so this works
 #  against the installed striqt build which may differ from the vendored source)
 # ---------------------------------------------------------------------------
+
+def seal_open_fds_for_exec():
+    """Set close-on-exec on every currently open non-stdio descriptor.
+
+    Some AIR-T driver descriptors are created inheritable.  Python's
+    ``close_fds=True`` did not close them in the radio's deployed runtime, so a
+    journal follower retained XDMA after the live stream released it.  CLOEXEC
+    is enforced by the kernel and leaves the parent process completely
+    unchanged.  The helper is intentionally device-agnostic: server sockets,
+    USB/IIO handles, and future SDR backends must not leak into child tools
+    either.
+    """
+    fd_dir = "/proc/self/fd"
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return
+    for name in names:
+        try:
+            fd = int(name)
+            if fd > 2:
+                os.set_inheritable(fd, False)
+        except (OSError, ValueError):
+            # The directory iterator itself and other threads can close an fd
+            # between listdir() and fcntl(); that race is harmless.
+            pass
 
 def get_device(source):
     return getattr(source, "_device", getattr(source, "device", None))
@@ -55,6 +83,7 @@ def open_stream(source):
         raise RuntimeError("striqt source has no RX stream/device")
     if getattr(rx, "stream", None) is None:
         rx.open(dev)
+    seal_open_fds_for_exec()
 
 def enable_stream(source, enabled):
     rx     = get_rx_stream(source)
@@ -64,22 +93,39 @@ def enable_stream(source, enabled):
     stream = getattr(rx, "stream", None)
     if dev is None or stream is None:
         return
+    # Prefer striqt's stream wrapper.  Besides invoking SoapySDR it maintains
+    # RxStream._enabled; bypassing it left that flag false after activation and
+    # made later arm/recovery transitions issue duplicate activate/deactivate
+    # calls.  On SoapyAIRT a failed duplicate activation reports XDMA EBUSY.
+    wrapper_enable = getattr(rx, "enable", None)
+    if callable(wrapper_enable):
+        wrapper_enable(dev, bool(enabled))
+        if enabled:
+            seal_open_fds_for_exec()
+        return
     methods = (("activateStream", "activate_stream") if enabled
                else ("deactivateStream", "deactivate_stream"))
+    last_error = None
     for meth in methods:
         fn = getattr(dev, meth, None)
         if fn is not None:
             try:
                 fn(stream)
+                if enabled:
+                    seal_open_fds_for_exec()
                 return
             except TypeError:
                 try:
                     fn(stream, 0, 0, 0)
+                    if enabled:
+                        seal_open_fds_for_exec()
                     return
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as exc:
+                    last_error = exc
+            except Exception as exc:
+                last_error = exc
+    if last_error is not None:
+        raise last_error
 
 def close_source(source):
     for action in [lambda: enable_stream(source, False),

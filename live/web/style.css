@@ -165,7 +165,8 @@ h1, h2 { font-weight: 600; }
 }
 .rail-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg2); flex: 0 0 auto; }
 .rail-tab {
-    flex: 1; text-align: center; padding: 10px 0; font-size: 11px; font-weight: 700;
+    flex: 1 1 0; min-width: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 10px 0; font-size: 11px; font-weight: 700;
     letter-spacing: 0.06em; color: var(--text-faint); border-bottom: 2px solid transparent;
     cursor: pointer; user-select: none;
 }
@@ -291,19 +292,33 @@ body.analysis-psd #psd-row .legend-key { display: none; }
 #psd-row { flex: 1.05 1 0; min-height: 0; display: flex; flex-direction: column; }
 #psd-container { flex: 1 1 auto; min-height: 0; background: var(--plot-bg); overflow: hidden; position: relative; padding: 6px; }
 
-/* uPlot core layout. The stylesheet is normally vendored at vendor/uPlot.min.css,
-   but that <link> has no fallback and 404s on any checkout whose setup.sh never
-   fetched it — or fetched the JS but not the CSS (setup gates the CSS fetch on the
-   JS file existing, so a one-time CSS fetch failure is never retried). Without
-   `.uplot canvas { width/height:100% }` the plot canvas renders at its device-pixel
-   backing-store size on HiDPI/Retina displays (2×) and is clipped to the top-left
-   corner. Inlined here so the PSD plot is correct with zero external CSS. */
+/* Complete uPlot 1.6.31 core layout.  Keep this local even when the vendored
+   stylesheet exists: a missing/offline asset must not turn the HiDPI backing
+   canvas and legend into oversized normal-flow elements clipped at top-left. */
+.uplot, .uplot *, .uplot *::before, .uplot *::after { box-sizing: border-box; }
+.uplot {
+    width: min-content; line-height: 1.5;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+.u-title { text-align: center; font-size: 18px; font-weight: bold; }
 .u-wrap { position: relative; user-select: none; }
 .u-over, .u-under { position: absolute; }
 .u-under { overflow: hidden; }
 .uplot canvas { display: block; position: relative; width: 100%; height: 100%; }
 .u-axis { position: absolute; }
-.u-select { position: absolute; pointer-events: none; }
+.u-legend { font-size: 14px; margin: auto; text-align: center; }
+.u-inline { display: block; }
+.u-inline * { display: inline-block; }
+.u-inline tr { margin-right: 16px; }
+.u-legend th { font-weight: 600; }
+.u-legend th > * { vertical-align: middle; display: inline-block; }
+.u-legend .u-marker { width: 1em; height: 1em; margin-right: 4px; background-clip: padding-box !important; }
+.u-inline.u-live th::after { content: ":"; vertical-align: middle; }
+.u-inline:not(.u-live) .u-value { display: none; }
+.u-series > * { padding: 4px; }
+.u-series th { cursor: pointer; }
+.u-legend .u-off > * { opacity: 0.3; }
+.u-select { background: rgba(0,0,0,0.07); position: absolute; pointer-events: none; }
 .u-cursor-x, .u-cursor-y { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
 .u-hz .u-cursor-x, .u-vt .u-cursor-y { height: 100%; border-right: 1px dashed #607D8B; }
 .u-hz .u-cursor-y, .u-vt .u-cursor-x { width: 100%; border-bottom: 1px dashed #607D8B; }
@@ -365,6 +380,7 @@ button:active { background: var(--bg2); }
 /* ══ ADMIN / ROLE / MODE VISIBILITY ═══════════════════════════════════════ */
 .admin-only { display: none !important; }
 body.is-admin .admin-only { display: block !important; }
+body.is-admin .rail-tab.admin-only { display: flex !important; }
 /* Admin visibility must not override which inspector tab is active. */
 body.is-admin .rail-panel.admin-only { display: none !important; }
 body.is-admin .rail-panel.admin-only.active { display: flex !important; }
@@ -559,7 +575,7 @@ body.light-theme .op-summary { color: #26313c; }
 /* Recording panel and the all-viewer live-stream replacement banner. */
 .record-field { display: block; margin: 8px 0; color: var(--dim); font-size: 11px; }
 .record-field input, #record-yaml { width: 100%; margin-top: 3px; box-sizing: border-box; }
-.record-check { display: block; margin: 10px 0; font-size: 11px; }
+.record-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; font-size: 11px; }
 .record-summary { padding: 7px; margin: 6px 0; border: 1px solid var(--border);
                   border-radius: 5px; color: var(--dim); font: 10.5px/1.5 monospace;
                   overflow-wrap: anywhere; }

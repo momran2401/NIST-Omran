@@ -114,13 +114,17 @@ install_python_deps() {
     fi
     # Offline plot assets: the repo vendors uPlot; restore it when missing so
     # hotspot/ethernet modes never depend on a CDN.
-    if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" ]]; then
-        say "Fetching vendored uPlot (missing from checkout)…"
+    if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" || ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.css" ]]; then
+        say "Fetching missing vendored uPlot assets…"
         mkdir -p "$REPO_ROOT/live/web/vendor"
-        curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js \
-            -o "$REPO_ROOT/live/web/vendor/uPlot.min.js" 2>/dev/null || true
-        curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css \
-            -o "$REPO_ROOT/live/web/vendor/uPlot.min.css" 2>/dev/null || true
+        if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.js" ]]; then
+            curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js \
+                -o "$REPO_ROOT/live/web/vendor/uPlot.min.js" 2>/dev/null || true
+        fi
+        if [[ ! -s "$REPO_ROOT/live/web/vendor/uPlot.min.css" ]]; then
+            curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css \
+                -o "$REPO_ROOT/live/web/vendor/uPlot.min.css" 2>/dev/null || true
+        fi
     fi
     # Sanity: can the core import?
     "$REPO_ROOT/.venv/bin/python3" - <<'PYCHECK' || warn "core import check failed"
