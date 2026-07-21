@@ -1084,6 +1084,21 @@ class SharedConfig:
         )
         return snap
 
+    def restore_config(self, config: RadioConfig, reason=""):
+        """Roll back a recipe that validated but failed at hardware apply."""
+        with self._lock:
+            self._cfg = config.snapshot()
+            self._dirty = False
+            self._reconnect = False
+            self._pending_op = None
+            snap = self._cfg.snapshot()
+        self.push_notice(
+            "hardware rejected the requested configuration"
+            + (" ({})".format(reason) if reason else "")
+            + " — restored the last working recipe"
+        )
+        return snap
+
     def stop(self):
         with self._lock:
             self._stop = True
@@ -1091,4 +1106,3 @@ class SharedConfig:
     def stopped(self):
         with self._lock:
             return self._stop
-

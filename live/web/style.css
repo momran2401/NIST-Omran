@@ -344,6 +344,9 @@ button:active { background: var(--bg2); }
 /* ══ ADMIN / ROLE / MODE VISIBILITY ═══════════════════════════════════════ */
 .admin-only { display: none !important; }
 body.is-admin .admin-only { display: block !important; }
+/* Admin visibility must not override which inspector tab is active. */
+body.is-admin .rail-panel.admin-only { display: none !important; }
+body.is-admin .rail-panel.admin-only.active { display: flex !important; }
 body.mode-pro  .noob-only { display: none !important; }
 body.mode-noob .pro-only  { display: none !important; }
 body.role-readonly .rail-panel { opacity: 0.6; }
@@ -531,3 +534,21 @@ body.light-theme .op-summary { color: #26313c; }
 }
 
 .op-state.op-dim { color: var(--dim, #8aa0b3); background: rgba(138,160,179,0.12); }
+
+/* Recording panel and the all-viewer live-stream replacement banner. */
+.record-field { display: block; margin: 8px 0; color: var(--dim); font-size: 11px; }
+.record-field input, #record-yaml { width: 100%; margin-top: 3px; box-sizing: border-box; }
+.record-check { display: block; margin: 10px 0; font-size: 11px; }
+.record-summary { padding: 7px; margin: 6px 0; border: 1px solid var(--border);
+                  border-radius: 5px; color: var(--dim); font: 10.5px/1.5 monospace;
+                  overflow-wrap: anywhere; }
+.record-advanced summary { cursor: pointer; color: var(--accent); font-size: 11px; }
+.record-advanced p { color: var(--dim); font-size: 10px; }
+#record-yaml { resize: vertical; min-height: 130px; font: 10px/1.4 monospace; }
+#recording-banner { position: fixed; z-index: 50; top: 54px; left: 50%;
+                    transform: translateX(-50%); padding: 9px 16px;
+                    border: 1px solid #ffb74d; border-radius: 7px;
+                    background: #30240d; color: #ffd28a; font: 600 12px sans-serif;
+                    box-shadow: 0 4px 20px rgba(0,0,0,.35); }
+body.recording #settings-apply, body.recording #analysis-apply,
+body.recording #reset-radio-btn { opacity: .45; pointer-events: none; }

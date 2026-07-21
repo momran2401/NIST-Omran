@@ -8,7 +8,7 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=20260721-3">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
@@ -60,6 +60,7 @@
         <div class="rail-tab active" data-tab="display" role="tab">DISPLAY</div>
         <div class="rail-tab pro-only" data-tab="psd" role="tab">PSD</div>
         <div class="rail-tab pro-only" data-tab="capture" role="tab">CAPTURE</div>
+        <div class="rail-tab pro-only admin-only" data-tab="record" role="tab">RECORD</div>
         <div class="rail-tab" data-tab="ops" role="tab">OPS</div>
     </div>
 
@@ -118,6 +119,31 @@
             <label class="ctrl-row check pro-only"><span>Absolute RF</span><input type="checkbox" id="abs-rf" checked></label>
 
             <button id="reset-radio-btn" class="rail-danger pro-only admin-only" title="Restart the radio-web service (all viewers briefly disconnect)">Reset Radio</button>
+        </section>
+
+        <section class="rail-panel pro-only admin-only" data-panel="record">
+            <h3 class="settings-h">Record current view</h3>
+            <div id="record-summary" class="record-summary">Loading current settings…</div>
+            <label class="record-field">Center (MHz)<input id="record-center" type="number" step="0.001"></label>
+            <label class="record-field">Rate (MS/s)<input id="record-rate" type="number" step="0.01"></label>
+            <label class="record-field">Gain (dB)<input id="record-gain" type="number" step="0.1"></label>
+            <label class="record-field">Duration (seconds; blank = until Stop)
+                <input id="record-duration" type="number" min="0.1" step="0.1" placeholder="until Stop">
+            </label>
+            <label class="record-field">Recordings directory
+                <input id="record-directory" type="text">
+            </label>
+            <label class="record-check"><input id="record-raw-iq" type="checkbox"> Include raw IQ (large)</label>
+            <details class="record-advanced">
+                <summary>Advanced raw YAML (multi-frequency sweeps)</summary>
+                <p>Leave blank to use the current live view. A full sweep YAML here replaces the generated spec.</p>
+                <textarea id="record-yaml" rows="14" spellcheck="false"></textarea>
+            </details>
+            <div class="btn-row">
+                <button id="record-start" type="button">● Record</button>
+                <button id="record-stop" type="button" disabled>■ Stop</button>
+            </div>
+            <div id="record-status" class="record-summary">idle</div>
         </section>
 
         <!-- ── PSD panel ────────────────────────────────────────────────── -->
@@ -185,6 +211,8 @@
     <div id="band-monitor">Band monitor: --</div>
 </aside>
 
+<div id="recording-banner" hidden>Recording in progress — live display will resume automatically.</div>
+
 <!-- ══ MAIN DASHBOARD ═══════════════════════════════════════════════════════ -->
 <main id="dashboard">
 
@@ -213,7 +241,7 @@
     <section class="panel" id="psd-row">
         <div class="panel-head">
             <h2>Power spectral density</h2>
-            <span class="panel-hint">wheel: zoom · drag: pan · Shift-drag: zoom box · Alt-drag: band · double-click: reset</span>
+            <span class="panel-hint">live auto-scaled spectrum</span>
             <div class="legend-key">
                 <span class="key"><i class="swatch swatch-mean"></i>Mean</span>
                 <span class="key"><i class="swatch swatch-max"></i>Max</span>
@@ -259,7 +287,7 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js"></script>
+<script src="app.js?v=20260721-3"></script>
 
 <!-- Rail tab switching (layout only — plain divs, never sends control) -->
 <script>

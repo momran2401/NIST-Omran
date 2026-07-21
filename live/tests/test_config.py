@@ -123,3 +123,14 @@ def test_snapshot_is_isolated(shared):
     snap = shared.snapshot()
     snap.center = 1.0
     assert shared.snapshot().center != 1.0
+
+
+def test_restore_config_rolls_back_failed_hardware_recipe(shared):
+    good = shared.snapshot()
+    shared.update({"sample_rate": 3.84e6, "gain": 2.0})
+    restored = shared.restore_config(good, reason="driver rejected arm")
+    assert restored.sample_rate == good.sample_rate
+    assert restored.gain == good.gain
+    dirty, current, op_id, reconnect = shared.take_dirty()
+    assert not dirty and op_id is None and not reconnect
+    assert current.sample_rate == good.sample_rate

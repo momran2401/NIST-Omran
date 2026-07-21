@@ -20,7 +20,7 @@ from .constants import (
 from .dsp import build_header, compute_blocks, samples_needed
 from .operations import OPERATIONS, verdict_state
 from .shims import (
-    close_source, enable_stream, get_stream_mtu, get_stream_ports,
+    _close_rx_stream, close_source, enable_stream, get_stream_mtu, get_stream_ports,
     open_stream, query_device_envelope, stream_buffers_for,
 )
 from .striqt_compat import ReceiveStreamError, specs
@@ -91,6 +91,19 @@ class Acquirer(threading.Thread):
         # when the first frame of that generation is actually computed.
         self._verify_lock = threading.Lock()
         self._verify      = None
+        self._pause_requested = threading.Event()
+        self._paused = threading.Event()
+
+    def pause_and_release(self, timeout=10.0):
+        """Ask the acquisition loop to close the device, then wait for it."""
+        self._pause_requested.set()
+        return self._paused.wait(timeout)
+
+    def resume(self):
+        self._pause_requested.clear()
+
+    def is_paused(self):
+        return self._paused.is_set()
 
     # --- Latest-frame slot (thread-safe) ---
 
@@ -329,7 +342,26 @@ class Acquirer(threading.Thread):
             f"rearm: center {cfg.center/1e6:.6g} MHz, "
             f"{cfg.sample_rate/1e6:.6g} MS/s, gain {cfg.gain:.1f} dB, "
             f"nfft={cfg.nfft}, rows={cfg.rows}")
-        open_stream(self.source)
+        # SoapyAIRT exposes one RX DMA stream. Opening a replacement while the
+        # previous stream owns /dev/xdma0_c2h_0 fails with EBUSY. Release only
+        # the RX stream; source.close() would tear down the process-lifetime
+        # AIR-T device and its management sensors.
+        enable_stream(self.source, False)
+        _close_rx_stream(self.source)
+        # The XDMA character device can remain busy briefly after close.
+        # Retry only this RX stream on the same initialized source.
+        open_error = None
+        for attempt in range(6):
+            try:
+                open_stream(self.source)
+                open_error = None
+                break
+            except Exception as exc:
+                open_error = exc
+                _close_rx_stream(self.source)
+                time.sleep(0.05 * (attempt + 1))
+        if open_error is not None:
+            raise open_error
         self.source.arm_spec(make_capture(cfg))
         enable_stream(self.source, True)
         # Drop stale samples from the old tuning so they never mix into a frame.
@@ -354,6 +386,14 @@ class Acquirer(threading.Thread):
     def _recover(self, cfg: RadioConfig, reason: str):
         """Close and reopen the radio. Returns new (read_size, tmp, buffers)."""
         print(f"[radio] recovering after: {reason}")
+        if state.DEVICE == "air8201b" and self.source is not None:
+            # source.close() deinitializes the AD9371 management sensors for
+            # this process. Recover AIR-T by replacing only its RX stream.
+            with self._lock:
+                self._clear_ring_locked()
+            time.sleep(0.1)
+            self.rearm(cfg)
+            return self._make_read_buffers()
         if self.source is not None:
             close_source(self.source)
             self.source = None
@@ -370,10 +410,56 @@ class Acquirer(threading.Thread):
         try:
             self.open_radio(cfg)
             self._last_good_source = dict(cfg.source_config or {})
+            last_good_cfg = cfg.snapshot()
             read_size, tmp, buffers = self._make_read_buffers()
             last_log = 0.0
 
             while not self.shared.stopped():
+                if self._pause_requested.is_set():
+                    if self.source is not None:
+                        # Keep the process-lifetime AIR-T device initialized.
+                        # source.close() deinitializes its AD9371 management
+                        # sensors and the driver cannot rebuild them without a
+                        # process restart. The recording runner takes ownership
+                        # of this exact source object while live reads pause.
+                        enable_stream(self.source, False)
+                        _close_rx_stream(self.source)
+                    with self._lock:
+                        self._clear_ring_locked()
+                    self._paused.set()
+                    while (self._pause_requested.is_set()
+                           and not self.shared.stopped()):
+                        time.sleep(0.05)
+                    self._paused.clear()
+                    if self.shared.stopped():
+                        break
+                    cfg = self.shared.snapshot()
+                    if self.source is not None:
+                        try:
+                            self.rearm(cfg, None)
+                            read_size, tmp, buffers = self._make_read_buffers()
+                            continue
+                        except Exception as exc:
+                            print(f"[radio] resume rearm failed: {exc}; reopening")
+                            close_source(self.source)
+                            self.source = None
+                    # AIR-T management sensors can remain unavailable briefly
+                    # after another process closes the device. A transient
+                    # reopen error must not kill this long-lived thread and
+                    # leave the web viewer permanently degraded.
+                    while (not self._pause_requested.is_set()
+                           and not self.shared.stopped()):
+                        try:
+                            self.open_radio(cfg)
+                            read_size, tmp, buffers = self._make_read_buffers()
+                            break
+                        except Exception as exc:
+                            if self.source is not None:
+                                close_source(self.source)
+                                self.source = None
+                            print(f"[radio] resume open failed: {exc}; retry in 1s")
+                            time.sleep(1.0)
+                    continue
                 dirty, new_cfg, op_id, reconnect = self.shared.take_dirty()
                 if dirty:
                     cfg = new_cfg
@@ -395,6 +481,7 @@ class Acquirer(threading.Thread):
                             self.rearm(cfg, op_id)
                         read_size, tmp, buffers = self._make_read_buffers()
                         self._last_good_source = dict(cfg.source_config or {})
+                        last_good_cfg = cfg.snapshot()
                     except Exception as e:
                         OPERATIONS.finish(op_id, "failed",
                                           f"hardware apply raised: {e}")
@@ -403,6 +490,19 @@ class Acquirer(threading.Thread):
                             # — revert to the last set that actually opened.
                             cfg = self.shared.restore_source(
                                 self._last_good_source, reason=str(e))
+                        else:
+                            # A rejected arm must not destroy AIR-T's
+                            # process-lifetime device singleton. Restore the
+                            # last recipe on the same initialized source.
+                            cfg = self.shared.restore_config(
+                                last_good_cfg, reason=str(e))
+                            try:
+                                self.rearm(cfg, None)
+                                read_size, tmp, buffers = self._make_read_buffers()
+                                continue
+                            except Exception as rollback_error:
+                                print(f"[radio] rollback rearm failed: "
+                                      f"{rollback_error}; full recovery needed")
                         try:
                             read_size, tmp, buffers = self._recover(cfg, str(e))
                         except Exception as re:
@@ -546,6 +646,18 @@ class DemoAcquirer(threading.Thread):
         self._lock            = threading.Lock()
         self._latest_header   = None
         self._latest_blocks   = None
+        self._pause_requested = threading.Event()
+        self._paused          = threading.Event()
+
+    def pause_and_release(self, timeout=10.0):
+        self._pause_requested.set()
+        return self._paused.wait(timeout)
+
+    def resume(self):
+        self._pause_requested.clear()
+
+    def is_paused(self):
+        return self._paused.is_set()
 
     def latest(self):
         with self._lock:
@@ -571,6 +683,14 @@ class DemoAcquirer(threading.Thread):
         interval = 1.0 / max(state.BROADCAST_FPS, 1.0)
         next_t = time.time()
         while not self.shared.stopped():
+            if self._pause_requested.is_set():
+                self._paused.set()
+                while (self._pause_requested.is_set()
+                       and not self.shared.stopped()):
+                    time.sleep(0.05)
+                self._paused.clear()
+                next_t = time.time()
+                continue
             # This is the compute thread in demo mode — serve tier-2 probes here
             # for the same thread-bound-cache reason as the Computer (P2a-5).
             self.shared.service_probe()
@@ -637,4 +757,3 @@ class DemoAcquirer(threading.Thread):
                 time.sleep(dt)
             else:
                 next_t = time.time()
-

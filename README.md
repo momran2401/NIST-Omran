@@ -167,6 +167,10 @@ tuning range are greyed out.
   are in **MHz / MS/s**, seeded from what the server actually runs, and Apply
   sends **only what you changed**. Source-spec fields (clock source,
   calibration, …) apply through a verified device reconnect.
+- **RECORD** (DAN, admin) — a supervised striqt sweep seeded from the live
+  center/rate/gain and analyses. Raw IQ is opt-in; advanced YAML supports
+  multi-frequency sweeps. Controls lock while the radio records, all viewers
+  see a banner, and live acquisition resumes after Stop, duration, or error.
 - **OPS** — the verified-operations trail (every change with its
   validation → readback → verdict stages), service health, and — for admins —
   a live tail of the service journal.
@@ -220,6 +224,8 @@ as environment variables:
 | `RADIO_MODE` | `web` / `hotspot` / `ethernet` / `kiosk` / `terminal` (service entrypoint) |
 | `RADIO_DEVICE`, `RADIO_PORT`, `RADIO_EXTRA_ARGS` | service device/port/extra flags |
 | `RADIO_SERVICE_NAME` | systemd unit the Reset Radio button restarts (default `radio-web`) |
+| `RADIO_RECORDINGS_DIR` | recording root (default `<repo>/recordings`) |
+| `RADIO_RECORDING_SETTLE_SEC` | radio-release delay before sweep startup (default `2.0`) |
 | `SPEC_BACKEND` | default analysis backend |
 | `RADIO_KIOSK_BROWSER` | kiosk browser executable override |
 

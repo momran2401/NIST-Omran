@@ -145,12 +145,19 @@ def self_test(client, timeout=30.0):
     cap, env = config["capture"], config["envelope"]
     center = float(cap["center_frequency"])
     step = 1e6 if center + 1e6 <= env["freq_max"] else -1e6
-    rates = [r for r in (3.84e6, 7.68e6, 15.36e6, 30.72e6)
+    # Prefer a higher LTE-grid rate: AIR-T's current CV firmware accepts
+    # 15.36/30.72 MS/s but rejects the nominal lower grid points.
+    rates = [r for r in (30.72e6, 15.36e6, 7.68e6, 3.84e6)
              if env["rate_min"] <= r <= env["rate_max"]
              and r != cap["sample_rate"]]
-    alt_gain = (min(env["gain_max"], cap["gain"] + 1.0)
-                if cap["gain"] + 1.0 <= env["gain_max"]
-                else max(env["gain_min"], cap["gain"] - 1.0))
+    if env["gain_min"] < 0 and cap["gain"] <= 0:
+        # AIR-T calibrated gain is attenuation-like; positive values in the
+        # broad profile envelope are rejected by this firmware.
+        alt_gain = max(env["gain_min"], cap["gain"] - 1.0)
+    else:
+        alt_gain = (min(env["gain_max"], cap["gain"] + 1.0)
+                    if cap["gain"] + 1.0 <= env["gain_max"]
+                    else max(env["gain_min"], cap["gain"] - 1.0))
     alt_nfft = next(n for n in (256, 512, 1024, 2048, 4096)
                     if n != int(cap["nfft"]))
 

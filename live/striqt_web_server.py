@@ -47,6 +47,7 @@ from core.config import SharedConfig
 from core.constants import BACKENDS, CALIBRATED_GRID_BACKENDS, DEVICE_PROFILES
 from core.dsp import aligned_nfft
 from core.operations import OPERATIONS
+from core.recording import RecordingManager
 from core.serialization import serialize_frame
 from core.striqt_compat import _ANALYSIS_OK, _SENSOR_OK
 
@@ -434,6 +435,7 @@ _quantize = False
 _connections: set = set()   # ALL clients (broadcast fan-out set)
 _slot_lock = asyncio.Lock() # guards the single-admin slot
 _admin_ws  = None           # the one active admin socket, or None
+_recording = None           # RecordingManager
 
 
 @asynccontextmanager
@@ -452,6 +454,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if _recording is not None:
+            await _recording.shutdown()
         _shared.stop()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError,
@@ -610,6 +614,37 @@ async def operations_endpoint():
     return JSONResponse(_json_safe({"operations": OPERATIONS.recent(50)}))
 
 
+@app.get("/record")
+async def record_status_endpoint():
+    """Recording state plus a form seed derived from the current live view."""
+    return JSONResponse(_json_safe({
+        "recording": _recording.status(),
+        "defaults": _recording.defaults(),
+        "config": current_config(),
+    }))
+
+
+@app.post("/record")
+async def record_start_endpoint(request: Request):
+    if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        result = await _recording.start(payload)
+        return JSONResponse({"recording": _json_safe(result)}, status_code=202)
+    except (ValueError, TypeError, RuntimeError, OSError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409 if _recording.active() else 400)
+
+
+@app.post("/record/stop")
+async def record_stop_endpoint(request: Request):
+    if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
+        return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    return JSONResponse({"recording": _json_safe(await _recording.stop())}, status_code=202)
+
+
 @app.post("/config")
 async def config_apply_endpoint(request: Request):
     """
@@ -619,6 +654,8 @@ async def config_apply_endpoint(request: Request):
     """
     if request.scope.get("role", DEFAULT_ROLE) not in WRITE_ROLES:
         return JSONResponse({"error": "admin privileges required"}, status_code=403)
+    if _recording.active():
+        return JSONResponse({"error": "controls are locked while recording"}, status_code=409)
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -666,6 +703,11 @@ async def logs_ws_endpoint(ws: WebSocket):
             "--no-pager", "-o", "short-iso",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # The AIR-T driver does not mark every XDMA descriptor CLOEXEC.
+            # Without this explicit boundary the journal follower can retain
+            # /dev/xdma0_c2h_0 after a retune closes the live RX stream,
+            # causing the replacement stream to fail with EBUSY.
+            close_fds=True,
         )
         while True:
             raw = await proc.stdout.readline()
@@ -960,6 +1002,7 @@ async def _broadcaster():
         # Structured operation stage events for the Operations tab.
         for ev in OPERATIONS.drain_events():
             texts.append(json.dumps({"op": _json_safe(ev)}))
+        texts.append(json.dumps({"recording": _json_safe(_recording.status())}))
         for text in texts:
             for ws in list(_connections):
                 try:
@@ -1074,6 +1117,11 @@ async def ws_endpoint(ws: WebSocket):
                         {"message": "read-only role: control ignored", "denied": True}
                     ))
                     continue
+                if _recording.active():
+                    await ws.send_text(json.dumps(
+                        {"message": "controls are locked while recording", "denied": True}
+                    ))
+                    continue
                 # Run in a worker thread: an analysis apply blocks on tier-2
                 # probes serviced by the compute thread (up to ~0.1 s per
                 # field), which must not stall the event loop / broadcaster.
@@ -1143,7 +1191,7 @@ else:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _acquirer, _computer, _shared, _quantize
+    global _acquirer, _computer, _shared, _quantize, _recording
 
     parser = argparse.ArgumentParser(
         description="striqt WebSocket live viewer server",
@@ -1239,6 +1287,7 @@ def main():
         _acquirer = Acquirer(_shared)
         _computer = Computer(_acquirer, _shared)
     health.bind(_acquirer, _shared)
+    _recording = RecordingManager(_acquirer, _shared, demo=is_demo)
 
     try:
         import uvicorn

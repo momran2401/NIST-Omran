@@ -31,7 +31,6 @@ let peakMarker  = true;
 let peakHold    = false;
 let showMin     = false;
 let psdYspan    = null;     // null = auto; number = fixed dB span
-let psdZoomX    = null;     // null = live follow (auto x); {min,max} = user zoom/pan
 let windowMs    = 20;
 let analysisMode = "spectrogram";
 let maxFps      = 15;       // client-side render-rate cap (LV-U1a)
@@ -377,6 +376,7 @@ function connect() {
                     }
                     return;
                 }
+                if (msg.recording) { updateRecordingUI(msg.recording); return; }
                 if (msg.op) { handleOpEvent(msg.op); return; }
                 if (msg.message && msg.message !== "ping") logMsg(msg.message);
                 if (msg.ack) {
@@ -697,6 +697,69 @@ async function refreshOps() {
     if (btn) btn.addEventListener("click", refreshOps);
     setTimeout(refreshOps, 800);   // backfill ops that predate this page load
 })();
+
+// ── Supervised recording -------------------------------------------------
+let recordingSeeded = false;
+
+function updateRecordingUI(rec) {
+    if (!rec) return;
+    const active = ["starting", "recording", "stopping"].includes(rec.state);
+    document.body.classList.toggle("recording", active);
+    const banner = document.getElementById("recording-banner");
+    if (banner) {
+        banner.hidden = !active;
+        if (active) banner.textContent = `Recording in progress · ${rec.captures || 0} captures · ${(rec.elapsed_s || 0).toFixed(1)} s — live display resumes automatically`;
+    }
+    const status = document.getElementById("record-status");
+    if (status) status.textContent = `${rec.state || "idle"}${rec.output ? "\n" + rec.output : ""}${rec.error ? "\n" + rec.error : ""}`;
+    const start = document.getElementById("record-start");
+    const stop = document.getElementById("record-stop");
+    if (start) start.disabled = active;
+    if (stop) stop.disabled = !active || rec.state === "stopping";
+}
+
+async function loadRecordingPanel() {
+    const r = await fetch("/record", {cache: "no-store"});
+    if (!r.ok) throw new Error(`record status HTTP ${r.status}`);
+    const data = await r.json();
+    updateRecordingUI(data.recording);
+    if (recordingSeeded) return;
+    recordingSeeded = true;
+    const d = data.defaults || {};
+    const c = data.config || {};
+    document.getElementById("record-center").value = (d.center_frequency / 1e6).toFixed(6);
+    document.getElementById("record-rate").value = (d.sample_rate / 1e6).toFixed(6);
+    document.getElementById("record-gain").value = d.gain;
+    document.getElementById("record-directory").value = d.directory || "";
+    const backend = c.backend || "spectrogram";
+    document.getElementById("record-summary").textContent =
+        `Seeded from live view · ${backend} · spectrogram + PSD + channel power`;
+}
+
+document.querySelector('.rail-tab[data-tab="record"]')?.addEventListener("click", () => {
+    loadRecordingPanel().catch(e => logMsg(e.message, "ERROR"));
+});
+document.getElementById("record-start")?.addEventListener("click", async () => {
+    const durationText = document.getElementById("record-duration").value.trim();
+    const payload = {
+        center_frequency: Number(document.getElementById("record-center").value) * 1e6,
+        sample_rate: Number(document.getElementById("record-rate").value) * 1e6,
+        gain: Number(document.getElementById("record-gain").value),
+        duration: durationText === "" ? null : Number(durationText),
+        directory: document.getElementById("record-directory").value.trim(),
+        include_raw_iq: document.getElementById("record-raw-iq").checked,
+        yaml: document.getElementById("record-yaml").value
+    };
+    const r = await fetch("/record", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    const data = await r.json();
+    if (!r.ok) { logMsg(`Record failed: ${data.error || r.status}`, "ERROR"); return; }
+    updateRecordingUI(data.recording);
+});
+document.getElementById("record-stop")?.addEventListener("click", async () => {
+    const r = await fetch("/record/stop", {method: "POST"});
+    const data = await r.json();
+    if (data.recording) updateRecordingUI(data.recording);
+});
 
 // ── Service journal tail (admin only): journalctl over /ws/logs ──────────
 let journalWs = null;
@@ -1107,8 +1170,6 @@ function initUplot(freqs) {
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
 
-    // Set up band dragging on the uPlot canvas
-    setupBandDrag();
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1273,6 @@ function initUplotPsdStats(freqs, stats) {
 
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
-    setupBandDrag();
 }
 
 function renderServerPsd(channels, blocks, rows, nfft) {
@@ -1241,9 +1301,7 @@ function renderServerPsd(channels, blocks, rows, nfft) {
             data.push(Array.from(tr));
         }
     }
-    // Preserve a user zoom/pan across incoming frames (reset only on retune
-    // via plot rebuild, or double-click). resetScales=false keeps the view.
-    uplot.setData(data, psdZoomX === null);
+    uplot.setData(data, true);
     psdData.server = { stats, traces };
 
     // Peak markers from the most peak-like trace (max if present, else the
@@ -1359,7 +1417,7 @@ function updatePSD(channels, blocks, rows, nfft) {
         vis.push(diffActive);
     }
 
-    uplot.setData(data, psdZoomX === null);   // keep a user zoom across frames
+    uplot.setData(data, true);
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
     // Peak markers (strongest bin per visible channel) — LV-U1b
