@@ -1170,6 +1170,8 @@ function initUplot(freqs) {
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
 
+    // Set up band dragging on the uPlot canvas
+    setupBandDrag();
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1275,7 @@ function initUplotPsdStats(freqs, stats) {
 
     const crossChk = document.getElementById("cross-chk");
     if (crossChk) uplot.cursor.show = crossChk.checked;
+    setupBandDrag();
 }
 
 function renderServerPsd(channels, blocks, rows, nfft) {
@@ -1301,7 +1304,7 @@ function renderServerPsd(channels, blocks, rows, nfft) {
             data.push(Array.from(tr));
         }
     }
-    uplot.setData(data, true);
+    uplot.setData(data);
     psdData.server = { stats, traces };
 
     // Peak markers from the most peak-like trace (max if present, else the
@@ -1417,7 +1420,7 @@ function updatePSD(channels, blocks, rows, nfft) {
         vis.push(diffActive);
     }
 
-    uplot.setData(data, true);
+    uplot.setData(data);
     vis.forEach((v, i) => { if (i > 0) uplot.setSeries(i, { show: v }); });
 
     // Peak markers (strongest bin per visible channel) — LV-U1b
@@ -1630,60 +1633,23 @@ function resetBand(freqs) {
     if (uplot) uplot.redraw();
 }
 
-// PSD interaction model (interactive-PSD):
-//   wheel        zoom the x-axis around the cursor
-//   drag         grab an existing band-monitor handle/body if hit, else PAN
-//   Shift-drag   rubber-band region zoom (uPlot's select box)
-//   Alt-drag     draw a NEW band-monitor selection
-//   double-click reset to the full span and resume live follow
-// The zoom state lives in psdZoomX; frames arriving while zoomed keep the view
-// (setData resetScales=false). A retune rebuilds the plot → zoom resets.
+// PSD band-monitor selection: drag to move/resize the analysis band.
+// No x-axis zoom/pan/box-zoom — the PSD always live-follows the full span.
 function setupBandDrag() {
     if (!uplot) return;
     const over = uplot.over;   // the event-capture div over the uPlot canvas
-    psdZoomX = null;
 
     let dragStart = null;
     let origLo, origHi;
-    let panStart = null;       // {px, min, max} while panning
-    let zoomSel  = null;       // {startPx} while shift-drag region zooming
 
     // Pointer events fire for mouse, touch and pen — touch-action:none keeps a
     // drag on a phone from scrolling the page instead of moving the band.
     over.style.touchAction = "none";
 
-    function pxOf(clientX) {
-        return clientX - over.getBoundingClientRect().left;
-    }
-
     function freqAtX(clientX) {
-        return uplot.posToVal(pxOf(clientX), "x");
-    }
-
-    function dataExtent() {
-        const xs = uplot.data && uplot.data[0];
-        if (!xs || !xs.length) return null;
-        return [xs[0], xs[xs.length - 1]];
-    }
-
-    function setZoom(min, max) {
-        const ext = dataExtent();
-        if (ext) {
-            // Clamp inside the data span; a window at (or past) full span
-            // returns to live-follow auto scaling.
-            const span = Math.min(max - min, ext[1] - ext[0]);
-            if (span >= (ext[1] - ext[0]) * 0.999) { resetZoom(); return; }
-            if (min < ext[0]) { min = ext[0]; max = ext[0] + span; }
-            if (max > ext[1]) { max = ext[1]; min = ext[1] - span; }
-        }
-        psdZoomX = { min, max };
-        uplot.setScale("x", psdZoomX);
-    }
-
-    function resetZoom() {
-        psdZoomX = null;
-        const ext = dataExtent();
-        if (ext) uplot.setScale("x", { min: ext[0], max: ext[1] });
+        const rect = over.getBoundingClientRect();
+        const px   = clientX - rect.left;
+        return uplot.posToVal(px, "x");
     }
 
     function hitTest(freq) {
@@ -1699,73 +1665,30 @@ function setupBandDrag() {
 
     over.style.cursor = "crosshair";
 
-    // ── Wheel: zoom around the cursor ────────────────────────────────────
-    over.addEventListener("wheel", (e) => {
-        e.preventDefault();
-        const scale = uplot.scales.x;
-        if (scale.min == null || scale.max == null) return;
-        const v = freqAtX(e.clientX);
-        if (v == null || !isFinite(v)) return;
-        const factor = e.deltaY < 0 ? 0.8 : 1.25;
-        setZoom(v - (v - scale.min) * factor, v + (scale.max - v) * factor);
-    }, { passive: false });
-
-    // ── Double-click: full span + live follow (uPlot also auto-resets) ───
-    over.addEventListener("dblclick", () => { resetZoom(); });
-
     over.addEventListener("pointerdown", (e) => {
         if (e.button !== 0) return;
         const f = freqAtX(e.clientX);
         if (f === null) return;
-
-        if (e.shiftKey) {
-            // Region zoom via uPlot's select box for the visuals.
-            zoomSel = { startPx: pxOf(e.clientX) };
-            uplot.setSelect({ left: zoomSel.startPx, width: 0,
-                              top: 0, height: uplot.over.clientHeight }, false);
-            over.style.cursor = "zoom-in";
+        const hit = hitTest(f);
+        if (hit) {
+            // Drag existing band
+            dragStart = f;
+            bandDrag  = hit;
+            origLo    = bandLo;
+            origHi    = bandHi;
+            over.style.cursor = hit === "body" ? "grab" : "ew-resize";
         } else {
-            const hit = e.altKey ? null : hitTest(f);
-            if (hit) {
-                // Drag existing band
-                dragStart = f;
-                bandDrag  = hit;
-                origLo    = bandLo;
-                origHi    = bandHi;
-                over.style.cursor = hit === "body" ? "grab" : "ew-resize";
-            } else if (e.altKey) {
-                // Draw new band (Alt-drag)
-                bandLo = f;
-                bandHi = f;
-                bandDrag = "new";
-                dragStart = f;
-            } else {
-                // Pan the zoomed view
-                const scale = uplot.scales.x;
-                panStart = { px: pxOf(e.clientX),
-                             min: scale.min, max: scale.max };
-                over.style.cursor = "grabbing";
-            }
+            // Draw new band
+            bandLo = f;
+            bandHi = f;
+            bandDrag = "new";
+            dragStart = f;
         }
         try { over.setPointerCapture(e.pointerId); } catch (_) {}
         e.preventDefault();
     });
 
     window.addEventListener("pointermove", (e) => {
-        if (zoomSel) {
-            const px = Math.max(0, Math.min(pxOf(e.clientX), over.clientWidth));
-            uplot.setSelect({ left: Math.min(zoomSel.startPx, px),
-                              width: Math.abs(px - zoomSel.startPx),
-                              top: 0, height: uplot.over.clientHeight }, false);
-            return;
-        }
-        if (panStart) {
-            const rectW = over.clientWidth || 1;
-            const dpx   = pxOf(e.clientX) - panStart.px;
-            const dval  = dpx * (panStart.max - panStart.min) / rectW;
-            setZoom(panStart.min - dval, panStart.max - dval);
-            return;
-        }
         if (!bandDrag) return;
         const f = freqAtX(e.clientX);
         if (f === null) return;
@@ -1777,24 +1700,7 @@ function setupBandDrag() {
         if (uplot) uplot.redraw();
     });
 
-    window.addEventListener("pointerup", (e) => {
-        if (zoomSel) {
-            const endPx = pxOf(e.clientX);
-            const a = Math.min(zoomSel.startPx, endPx);
-            const b = Math.max(zoomSel.startPx, endPx);
-            zoomSel = null;
-            uplot.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
-            if (b - a > 5) {
-                setZoom(uplot.posToVal(a, "x"), uplot.posToVal(b, "x"));
-            }
-            over.style.cursor = "crosshair";
-            return;
-        }
-        if (panStart) {
-            panStart = null;
-            over.style.cursor = "crosshair";
-            return;
-        }
+    window.addEventListener("pointerup", () => {
         if (bandDrag) {
             bandDrag = null;
             over.style.cursor = "crosshair";

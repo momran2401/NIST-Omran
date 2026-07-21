@@ -8,7 +8,7 @@
     <!-- No CDN dependencies: hotspot/ethernet modes run with no internet.
          Fonts fall back to the system stacks declared in style.css; uPlot is
          vendored in web/vendor/ (with a CDN fallback only if it is missing). -->
-    <link rel="stylesheet" href="style.css?v=20260721-3">
+    <link rel="stylesheet" href="style.css?v=20260721-4">
     <link rel="stylesheet" href="vendor/uPlot.min.css">
 </head>
 <body class="mode-pro">
@@ -241,7 +241,6 @@
     <section class="panel" id="psd-row">
         <div class="panel-head">
             <h2>Power spectral density</h2>
-            <span class="panel-hint">live auto-scaled spectrum</span>
             <div class="legend-key">
                 <span class="key"><i class="swatch swatch-mean"></i>Mean</span>
                 <span class="key"><i class="swatch swatch-max"></i>Max</span>
@@ -287,7 +286,7 @@ if (!window.uPlot) {
     document.write('<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"><\/script>');
 }
 </script>
-<script src="app.js?v=20260721-3"></script>
+<script src="app.js?v=20260721-4"></script>
 
 <!-- Rail tab switching (layout only — plain divs, never sends control) -->
 <script>
