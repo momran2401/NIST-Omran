@@ -1084,15 +1084,6 @@ function psdYLabel() {
         : "Integrated power (dB rel. FS)";
 }
 
-// PSD plot height follows its (flex) container so the layout can fit the viewport.
-function psdHeight() {
-    const c = document.getElementById("psd-container");
-    // Reserve room for uPlot's interactive legend below the plot so it isn't
-    // clipped by the fixed-height panel (the panel header carries the title,
-    // so uPlot's own title is hidden in CSS).
-    return Math.max(140, (c ? c.clientHeight : 312) - 12 - 46);
-}
-
 function initUplot(freqs) {
     const container = document.getElementById("psd-plot");
     container.innerHTML = "";  // clear previous instance
@@ -1125,7 +1116,7 @@ function initUplot(freqs) {
 
     const opts = {
         width:  w,
-        height: psdHeight(),
+        height: 300,
         title:  `Power Spectral Density (${chans.map((c, i) => rxName(i)).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -1140,7 +1131,7 @@ function initUplot(freqs) {
         },
         axes: [
             {
-                label:  absRF ? "Frequency (MHz)" : "Offset from center (MHz)",
+                label:  "Frequency (MHz)",
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -1241,7 +1232,7 @@ function initUplotPsdStats(freqs, stats) {
 
     const opts = {
         width:  w,
-        height: psdHeight(),
+        height: 300,
         title:  `Power Spectral Density — striqt statistics (${chans.map((_, i) => `RX${i + 1}`).join(" + ")})`,
         background: PSD_BG,
         cursor: {
@@ -1253,7 +1244,7 @@ function initUplotPsdStats(freqs, stats) {
         scales: { x: { time: false }, y: { auto: true } },
         axes: [
             {
-                label:  absRF ? "Frequency (MHz)" : "Offset from center (MHz)",
+                label:  "Frequency (MHz)",
                 stroke: PSD_FG, ticks: { stroke: PSD_FG }, grid: { stroke: "#243042" },
                 font:   "11px Menlo,monospace",
             },
@@ -1827,7 +1818,7 @@ function exportPng() {
 const resizeObserver = new ResizeObserver(() => {
     if (!uplot || !freqsMHz) return;
     const w = document.getElementById("psd-container").clientWidth;
-    uplot.setSize({ width: w, height: psdHeight() });
+    uplot.setSize({ width: w, height: 300 });
 });
 resizeObserver.observe(document.getElementById("psd-container"));
 
